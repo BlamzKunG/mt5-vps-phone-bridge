@@ -258,3 +258,48 @@ class RemoteMT5Bridge:
             return None
         except Exception:
             return None
+
+    def get_available_symbols(self, search: str = "XAU") -> List[Dict[str, Any]]:
+        """
+        สแกนดูรายชื่อคู่เงินทั้งหมดบนโบรกเกอร์ (เช่น ค้นหา 'XAU' จะเห็น XAUUSD, XAUUSD-ECN, XAUUSD.crp, XAUUSD247 ทั้งหมด)
+        ช่วยให้รู้ได้ทันทีว่าโบรกเกอร์มีคู่เงินทองคำตัวไหนเปิดให้เทรดบ้าง
+        """
+        try:
+            resp = self.session.get(f"{self.vps_url}/api/symbols", params={"search": search}, timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json().get("symbols", [])
+            logging.error(f"❌ ดึงรายชื่อคู่เงินล้มเหลว: {resp.text}")
+            return []
+        except Exception as e:
+            logging.error(f"❌ เกิดข้อผิดพลาดในการดึงรายชื่อคู่เงิน: {e}")
+            return []
+
+    def set_symbol_mapping(self, from_symbol: str, to_symbol: str) -> bool:
+        """
+        กำหนดการจับคู่สัญลักษณ์แบบเฉพาะเจาะจง (Override Mapping) จากโทรศัพท์มือถือ
+        เช่น set_symbol_mapping('XAUUSD', 'XAUUSD247') หรือ set_symbol_mapping('XAUUSD', 'XAUUSD.crp')
+        ทำให้บอทที่ส่ง 'XAUUSD' จะถูกส่งคำสั่งเข้า 'XAUUSD247' บนโบรกเกอร์ทันที
+        """
+        try:
+            payload = {"mappings": {from_symbol.upper(): to_symbol.strip()}}
+            resp = self.session.post(f"{self.vps_url}/api/config/symbol_map", json=payload, timeout=self.timeout)
+            if resp.status_code == 200:
+                logging.info(f"🎯 กำหนดคู่สัญลักษณ์สำเร็จ: {from_symbol} -> {to_symbol}")
+                return True
+            logging.error(f"❌ กำหนดคู่สัญลักษณ์ไม่สำเร็จ: {resp.text}")
+            return False
+        except Exception as e:
+            logging.error(f"❌ เกิดข้อผิดพลาดในการกำหนดคู่สัญลักษณ์: {e}")
+            return False
+
+    def get_symbol_mappings(self) -> Dict[str, Any]:
+        """ดึงดูตารางคู่สัญลักษณ์ที่กำหนดไว้ในปัจจุบัน"""
+        try:
+            resp = self.session.get(f"{self.vps_url}/api/config/symbol_map", timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            return {}
+        except Exception as e:
+            logging.error(f"❌ ดึงข้อมูล Symbol Mapping ไม่สำเร็จ: {e}")
+            return {}
+

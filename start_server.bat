@@ -9,6 +9,9 @@ echo.
 set BRIDGE_API_KEY=llm-trade-secret-key-2026
 set PORT=8000
 
+:: (ออปชันเสริม) บังคับคู่เงินเจาะจง เช่น XAUUSD ให้แมปเป็น XAUUSD247 หรือ XAUUSD.crp
+:: set SYMBOL_MAP=XAUUSD:XAUUSD247,EURUSD:EURUSD-ECN
+
 echo Checking Python installation...
 python --version
 if %errorlevel% neq 0 (

@@ -130,10 +130,54 @@ self.mt5_bridge = RemoteMT5Bridge(vps_url="http://<VPS_IP>:8000", api_key="llm-t
 
 ## 💎 ระบบ Auto-Discovery Suffix ของโบรกเกอร์ (Universal Symbol Resolver)
 
-ระบบมีฟังก์ชันสแกนชื่อคู่เงินของโบรกเกอร์อัตโนมัติ โดยที่คุณไม่ต้องแก้ชื่อคู่เงินในโค้ดมือถือ:
-- บัญชี Cent: `XAUUSDc`, `EURUSDc`, `GOLDc`
-- บัญชี Raw / ECN / Pro: `XAUUSD-xxx`, `XAUUSD-pro`, `XAUUSD.raw`, `XAUUSD_i`
-- บัญชี Micro / อื่นๆ: `XAUUSDm`, `XAUUSD.m`, `GOLD.pro`, `#XAUUSD`
+### 1. รองรับ Suffix แปลกๆ ได้หมดหรือไม่? (`XAUUSD-ECN`, `XAUUSD.kio`, ฯลฯ)
+**คำตอบ: ไม่มีปัญหาแน่นอน 100%!** 
+ระบบใช้ Regular Expression แบบ Dynamic Match:
+`^(#|r)?(XAUUSD|GOLD)([-._+/#]?[a-zA-Z0-9]+)?$`
+ดังนั้น ไม่ว่าโบรกเกอร์จะตั้งชื่อแปลกแค่ไหน เช่น:
+- มีขีดคั่น: `XAUUSD-ECN`, `XAUUSD-PRO`, `XAUUSD-RAW`, `XAUUSD-std`
+- มีจุดคั่น: `XAUUSD.kio`, `XAUUSD.m`, `XAUUSD.pro`, `GOLD.pro`
+- มีต่อท้ายติดกัน: `XAUUSDc`, `GOLDc`, `XAUUSD247`, `XAUUSDm`
+- มี Prefix นำหน้า: `#XAUUSD`, `rXAUUSD`
+ระบบจะตรวจจับและสแกนเจอทั้งหมด พร้อมทั้งจัดลำดับความสำคัญ (Priority Scoring) เลือกตัวที่เปิดให้เทรดจริง (`trade_mode=FULL`) ให้อัตโนมัติ
 
-คุณสามารถส่ง `symbol="XAUUSD"` หรือ `"EURUSD"` เข้ามาตามปกติ ตัว Bridge บน VPS จะค้นหาและจับคู่กับชื่อจริงที่เปิดให้เทรดบนโบรกเกอร์ (`trade_mode=FULL`) ให้เองแบบอัตโนมัติ 100%
+---
+
+### 2. กรณีโบรกเกอร์มีหลายตัวเลือกพร้อมกัน (เช่น `XAUUSD-ECN`, `XAUUSD.crp`, `XAUUSD247`)
+หากโบรกเกอร์มีทั้งทอง Spot ปกติ (`XAUUSD-ECN`), ทอง Crypto (`XAUUSD.crp`), และทองเสาร์-อาทิตย์ (`XAUUSD247`):
+- **หากส่ง `XAUUSD` ธรรมดามา**: ระบบจะฉลาดพอที่จะเลือกคู่ Spot มาตรฐานก่อน (ไม่แย่งไปเปิด 247 หรือ crp ในวันธรรมดา)
+- **หากต้องการระบุเจาะจง**: คุณสามารถเลือกทำได้ 3 วิธี:
+
+#### วิธีที่ A: ระบุชื่อคู่เงินตรงๆ ในโค้ดบนมือถือได้เลย (Direct Pass-Through)
+```python
+# ส่งชื่อตรงๆ เข้าไปได้ทันที MT5 จะเปิดคู่นั้นตรงๆ ไม่แปลง
+bridge.get_historical_data(symbol="XAUUSD247", timeframe="5m")
+bridge.open_position(direction="BUY", lot=0.01, symbol="XAUUSD247")
+```
+
+#### วิธีที่ B: ตั้งค่า Override Mapping จากมือถือได้เลย (สะดวกที่สุด)
+```python
+# สั่งครั้งเดียว บอทที่ส่ง 'XAUUSD' จะวิ่งเข้า 'XAUUSD247' อัตโนมัติ
+bridge.set_symbol_mapping("XAUUSD", "XAUUSD247")
+
+# หรือถ้าจะเทรดคริปโตโกลด์:
+bridge.set_symbol_mapping("XAUUSD", "XAUUSD.crp")
+```
+
+#### วิธีที่ C: ตั้งค่าที่ไฟล์ `start_server.bat` บน VPS
+```bat
+:: ในไฟล์ start_server.bat
+set SYMBOL_MAP=XAUUSD:XAUUSD247,EURUSD:EURUSD-ECN
+```
+
+---
+
+### 3. ตรวจสอบดูว่าโบรกเกอร์มีคู่เงินทองคำตัวไหนบ้างจากมือถือ
+คุณสามารถสั่งจากโทรศัพท์เครื่องนี้เพื่อดูรายชื่อคู่เงินทั้งหมดบนโบรกเกอร์ได้ทันที:
+```python
+symbols = bridge.get_available_symbols("XAU")
+for s in symbols:
+    print(f"ชื่อ: {s['name']:15} | เทรดได้: {s['is_tradeable']} | Spread: {s['spread']}")
+```
+
 

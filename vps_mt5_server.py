@@ -60,11 +60,29 @@ def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
         )
     return x_api_key
 
-# ----------------- MT5 Handler Class -----------------
 class MT5Gateway:
     def __init__(self):
         self.initialized = False
         self.symbol_cache: Dict[str, str] = {}
+        self.custom_mappings: Dict[str, str] = self._load_initial_mappings()
+
+    def _load_initial_mappings(self) -> Dict[str, str]:
+        """โหลดคู่แมปสัญลักษณ์แบบกำหนดเองจาก Environment Variable SYMBOL_MAP"""
+        import json
+        mappings = {}
+        raw = os.environ.get("SYMBOL_MAP", "").strip()
+        if not raw:
+            return mappings
+        try:
+            if raw.startswith("{"):
+                return json.loads(raw)
+            for pair in raw.split(","):
+                if ":" in pair:
+                    k, v = pair.split(":", 1)
+                    mappings[k.strip().upper()] = v.strip()
+        except Exception as e:
+            logger.warning(f"⚠️ ไม่สามารถแปลงค่า SYMBOL_MAP ({raw}): {e}")
+        return mappings
 
     def ensure_connected(self) -> bool:
         if not MT5_AVAILABLE:
@@ -88,25 +106,38 @@ class MT5Gateway:
     def resolve_symbol(self, symbol: str) -> str:
         """
         แปลงชื่อคู่เงินให้ตรงกับชื่อบนโบรกเกอร์แบบอัตโนมัติ
-        รองรับ suffix ทุกรูปแบบ เช่น:
-        - XAUUSD-xxx (XAUUSD-pro, XAUUSD-ecn, XAUUSD-raw)
-        - Cent accounts: XAUUSDc, GOLDc, EURUSDc
-        - Micro accounts: XAUUSDm, XAUUSD.m, GOLD.m
-        - Custom suffixes: XAUUSD_i, XAUUSD+, #XAUUSD, GOLD.pro
+        ลำดับความสำคัญ:
+        0. ตรวจสอบ Custom Mapping ที่ผู้ใช้กำหนดเอง (เช่น XAUUSD -> XAUUSD247 หรือ XAUUSD.crp)
+        1. ตรวจสอบชื่อตรง (หากผู้ใช้ส่ง XAUUSD247 หรือ XAUUSD-ECN มาตรงๆ จะใช้ชื่อนั้นทันที)
+        2. Auto-Discovery สแกน Suffix ทั้งหมด (-ECN, .kio, c, m, pro)
+        3. Priority Scoring คัดกรองคู่เงินที่ trade_mode=FULL
         """
-        if symbol in self.symbol_cache:
-            return self.symbol_cache[symbol]
+        sym_clean = symbol.strip()
+        sym_upper = sym_clean.upper()
+
+        # 0. ตรวจสอบ Custom Mapping ที่กำหนดเองก่อนเป็นอันดับแรก
+        if sym_upper in self.custom_mappings:
+            target = self.custom_mappings[sym_upper]
+            if not self.ensure_connected():
+                return target
+            if mt5.symbol_select(target, True):
+                logger.info(f"🎯 [Explicit Mapping] ใช้การจับคู่แบบกำหนดเอง: '{symbol}' -> '{target}'")
+                return target
+            logger.warning(f"⚠️ สัญลักษณ์ที่กำหนดเอง '{target}' ไม่พบใน MT5 กำลัง fallback สแกนอัตโนมัติ...")
+
+        # ตรวจสอบจาก Cache
+        if sym_clean in self.symbol_cache:
+            return self.symbol_cache[sym_clean]
 
         if not self.ensure_connected():
-            return symbol
+            return sym_clean
 
-        # 1. เช็คชื่อตรงก่อน
-        if mt5.symbol_select(symbol, True):
-            self.symbol_cache[symbol] = symbol
-            return symbol
+        # 1. เช็คชื่อตรงก่อน (ถ้าส่ง XAUUSD247 หรือ XAUUSD.crp หรือ XAUUSD-ECN มาตรงๆ)
+        if mt5.symbol_select(sym_clean, True):
+            self.symbol_cache[sym_clean] = sym_clean
+            return sym_clean
 
         # 2. จัดเตรียมคีย์ค้นหาหลัก (Aliases)
-        sym_upper = symbol.upper()
         if "XAU" in sym_upper or "GOLD" in sym_upper:
             aliases = ["XAUUSD", "GOLD"]
         elif "BTC" in sym_upper or "BITCOIN" in sym_upper:
@@ -129,44 +160,51 @@ class MT5Gateway:
             candidates = []
 
             for alias in aliases:
-                # Regex รองรับ prefix เช่น # หรือ r และ suffix เช่น -xxx, c, .m, _i, +
+                # Regex รองรับ prefix (#, r) และ suffix ทุกชนิด เช่น -ECN, .kio, c, m, 247, .crp
                 pattern = re.compile(rf"^(#|r)?{re.escape(alias)}([-._+/#]?[a-zA-Z0-9]+)?$", re.IGNORECASE)
 
                 for s in all_syms:
                     s_name = s.name
                     if pattern.match(s_name):
-                        # จัดคะแนนความเหมาะสม (Priority Score)
                         score = 0
-                        # ถ้าเปิดการเทรดแบบเต็มรูปแบบ (SYMBOL_TRADE_MODE_FULL = 4)
+                        # 3.1 สถานะการเทรด (SYMBOL_TRADE_MODE_FULL = 4)
                         trade_mode = getattr(s, "trade_mode", 4)
                         if trade_mode == 4:
                             score += 10
-                        elif trade_mode != 0: # ไม่ได้ถูกปิด (Disabled)
+                        elif trade_mode != 0: # ไม่ได้ Disabled
                             score += 5
 
-                        # ถ้าเปิดมองเห็นใน Market Watch อยู่แล้ว
+                        # 3.2 เปิดมองเห็นใน Market Watch อยู่แล้ว
                         if getattr(s, "visible", False):
                             score += 3
 
-                        # ให้ความสำคัญกับชื่อที่สั้นกว่า (ใกล้เคียงต้นฉบับมากกว่า)
+                        # 3.3 ตรวจสอบความสอดคล้องกับเจตนาของผู้ใช้:
+                        # หากผู้ใช้ขอ XAUUSD ธรรมดา (ไม่ได้ระบุ 247 หรือ crp)
+                        # ให้คะแนนคู่ Spot (-ECN, .kio, .pro, c, m) สูงกว่า Synthetic/Crypto
+                        s_name_upper = s_name.upper()
+                        is_exotic = any(k in s_name_upper for k in ["247", "CRP", "CRYPTO", "SYN"])
+                        user_wants_exotic = any(k in sym_upper for k in ["247", "CRP", "CRYPTO", "SYN"])
+                        if is_exotic and not user_wants_exotic:
+                            score -= 8  # หักคะแนนคู่ 247/crp หากมีคู่ spot ปกติเปิดให้เทรด
+
+                        # 3.4 ให้ความสำคัญกับชื่อที่สั้นกว่า
                         score -= len(s_name) * 0.1
 
                         candidates.append((score, s_name))
 
             if candidates:
-                # เรียงลำดับจากคะแนนสูงสุด
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 best_match = candidates[0][1]
 
                 if mt5.symbol_select(best_match, True):
                     logger.info(f"🔍 [Universal Symbol Resolver] จับคู่สำเร็จ: '{symbol}' -> '{best_match}' (เลือกจากผู้สมัคร {len(candidates)} รายการ)")
-                    self.symbol_cache[symbol] = best_match
+                    self.symbol_cache[sym_clean] = best_match
                     return best_match
 
         # 4. Fallback แบบเดิมกรณีค้นหาไม่พบ
         logger.warning(f"⚠️ ไม่พบสัญลักษณ์ตรงหรือ suffix สำหรับ '{symbol}' บนโบรกเกอร์ ใช้ชื่อเดิม '{symbol}'")
-        self.symbol_cache[symbol] = symbol
-        return symbol
+        self.symbol_cache[sym_clean] = sym_clean
+        return sym_clean
 
 gateway = MT5Gateway()
 
@@ -189,7 +227,8 @@ class CloseRequest(BaseModel):
 class ModifyRequest(BaseModel):
     ticket: int = Field(..., description="Order Ticket ID")
     sl: Optional[float] = Field(None, description="Stop Loss ใหม่")
-    tp: Optional[float] = Field(None, description="Take Profit ใหม่")
+class SymbolMapRequest(BaseModel):
+    mappings: Dict[str, str] = Field(..., description="พจนานุกรมจับคู่สัญลักษณ์ เช่น {'XAUUSD': 'XAUUSD247'}")
 
 # ----------------- API Endpoints -----------------
 
@@ -199,7 +238,69 @@ def index():
         "status": "online",
         "service": "MT5 VPS Bridge for LLM Trading",
         "docs": "/docs",
-        "mt5_connected": gateway.ensure_connected()
+        "mt5_connected": gateway.ensure_connected(),
+        "custom_mappings": gateway.custom_mappings
+    }
+
+@app.get("/api/symbols")
+def list_available_symbols(search: Optional[str] = Query("XAU"), auth: str = Depends(verify_api_key)):
+    """
+    ค้นหารายชื่อคู่เงินบนโบรกเกอร์ (เช่น ค้นหา XAU จะเห็น XAUUSD, XAUUSD-ECN, XAUUSD.crp, XAUUSD247 ทั้งหมด)
+    ส่งกลับมาให้มือถือดูได้เลยว่าโบรกเกอร์มีคู่เงินอะไรบ้าง
+    """
+    if not gateway.ensure_connected():
+        raise HTTPException(status_code=503, detail="MT5 not connected")
+
+    all_syms = mt5.symbols_get()
+    if not all_syms:
+        return {"symbols": []}
+
+    search_upper = search.upper() if search else ""
+    trade_mode_map = {0: "DISABLED", 1: "LONGONLY", 2: "SHORTONLY", 3: "CLOSEONLY", 4: "FULL"}
+
+    results = []
+    for s in all_syms:
+        s_name_upper = s.name.upper()
+        s_desc_upper = (s.description or "").upper()
+        if not search_upper or search_upper in s_name_upper or search_upper in s_desc_upper:
+            results.append({
+                "name": s.name,
+                "description": s.description,
+                "trade_mode": trade_mode_map.get(s.trade_mode, str(s.trade_mode)),
+                "is_tradeable": (s.trade_mode == 4),
+                "visible": s.visible,
+                "digits": s.digits,
+                "spread": s.spread,
+                "point": s.point
+            })
+    return {
+        "search": search,
+        "count": len(results),
+        "symbols": results
+    }
+
+@app.get("/api/config/symbol_map")
+def get_symbol_map(auth: str = Depends(verify_api_key)):
+    """ดูตารางการจับคู่สัญลักษณ์แบบกำหนดเองในปัจจุบัน"""
+    return {
+        "custom_mappings": gateway.custom_mappings,
+        "cached_symbols": gateway.symbol_cache
+    }
+
+@app.post("/api/config/symbol_map")
+def set_symbol_map(req: SymbolMapRequest, auth: str = Depends(verify_api_key)):
+    """กำหนดหรืออัปเดตการจับคู่สัญลักษณ์แบบเฉพาะเจาะจงจากโทรศัพท์มือถือ"""
+    for k, v in req.mappings.items():
+        clean_k = k.strip().upper()
+        clean_v = v.strip()
+        gateway.custom_mappings[clean_k] = clean_v
+        # เคลียร์แคชเพื่อให้เริ่มใช้การจับคู่ใหม่ทันที
+        if clean_k in gateway.symbol_cache:
+            del gateway.symbol_cache[clean_k]
+    logger.info(f"🔄 [Config] อัปเดต Custom Symbol Map: {gateway.custom_mappings}")
+    return {
+        "status": "SUCCESS",
+        "custom_mappings": gateway.custom_mappings
     }
 
 @app.get("/health")
