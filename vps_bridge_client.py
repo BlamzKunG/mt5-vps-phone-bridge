@@ -18,8 +18,7 @@ class RemoteMT5Bridge:
     คลาส Client สำหรับเชื่อมต่อกับ Windows VPS ผ่าน HTTP API
     จำลองการทำงานเหมือนต่อตรงกับ MT5 บนเครื่อง แต่ข้อมูลทุกอย่างคุยผ่าน VPS
     """
-    def __init__(self, vps_url: str = "http://127.0.0.1:8000", api_key: str = "llm-trade-secret-key-2026", timeout: int = 15):
-        # ลบ trailing slash ถ้ามี
+    def __init__(self, vps_url: str = "http://127.0.0.1:8000", api_key: str = "llm-trade-secret-key-2026", timeout: int = 20):
         self.vps_url = vps_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
@@ -27,14 +26,42 @@ class RemoteMT5Bridge:
             "X-API-Key": self.api_key,
             "Content-Type": "application/json"
         }
+        self.initialized = False
+        self._init_session()
+
+    def _init_session(self):
+        """ตั้งค่า HTTP Session พร้อมระบบ Auto-Retry ป้องกันปัญหาเน็ตกระตุก / Stale Socket"""
+        from urllib3.util.retry import Retry
+        from requests.adapters import HTTPAdapter
+
         self.session = requests.Session()
         self.session.headers.update(self.headers)
-        self.initialized = False
+
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=5, pool_maxsize=5)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """ส่งคำขอ HTTP พร้อมระบบดักจับและกู้คืนการเชื่อมต่อหากเน็ตหลุด"""
+        url = f"{self.vps_url}{path}"
+        kwargs.setdefault("timeout", self.timeout)
+        try:
+            return self.session.request(method, url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError):
+            logging.warning("⚠️ ตรวจพบการตัดการเชื่อมต่อระหว่างทาง กำลังสร้าง Socket ใหม่และลองใหม่อัตโนมัติ...")
+            self._init_session()
+            return self.session.request(method, url, **kwargs)
 
     def connect(self) -> bool:
         """ตรวจสอบและเชื่อมต่อกับ VPS MT5 Bridge"""
         try:
-            resp = self.session.get(f"{self.vps_url}/health", timeout=self.timeout)
+            resp = self._request("GET", "/health")
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("status") == "HEALTHY":
@@ -61,7 +88,7 @@ class RemoteMT5Bridge:
     def check_health(self) -> Dict[str, Any]:
         """เรียกดูสถานะเซิร์ฟเวอร์แบบละเอียด"""
         try:
-            resp = self.session.get(f"{self.vps_url}/health", timeout=self.timeout)
+            resp = self._request("GET", "/health")
             return resp.json()
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
@@ -72,11 +99,7 @@ class RemoteMT5Bridge:
         คืนค่า: {'bid': float, 'ask': float, 'price': float, 'spread': float}
         """
         try:
-            resp = self.session.get(
-                f"{self.vps_url}/api/price",
-                params={"symbol": symbol},
-                timeout=self.timeout
-            )
+            resp = self._request("GET", "/api/price", params={"symbol": symbol})
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -99,15 +122,11 @@ class RemoteMT5Bridge:
         คืนค่า: pd.DataFrame ที่มีคอลัมน์ ['timestamp', 'open', 'high', 'low', 'close', 'volume']
         """
         try:
-            resp = self.session.get(
-                f"{self.vps_url}/api/ohlc",
-                params={
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "count": num_candles
-                },
-                timeout=self.timeout
-            )
+            resp = self._request("GET", "/api/ohlc", params={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": num_candles
+            })
             if resp.status_code == 200:
                 json_data = resp.json()
                 candles = json_data.get("data", [])
@@ -128,7 +147,7 @@ class RemoteMT5Bridge:
         คืนค่า: {'balance': float, 'equity': float, 'margin': float, 'free_margin': float, 'floating_pnl': float}
         """
         try:
-            resp = self.session.get(f"{self.vps_url}/api/account", timeout=self.timeout)
+            resp = self._request("GET", "/api/account")
             if resp.status_code == 200:
                 return resp.json()
             logging.error(f"❌ ดึงข้อมูลบัญชีล้มเหลว: {resp.text}")
@@ -148,7 +167,7 @@ class RemoteMT5Bridge:
             if magic is not None:
                 params["magic"] = magic
 
-            resp = self.session.get(f"{self.vps_url}/api/positions", params=params, timeout=self.timeout)
+            resp = self._request("GET", "/api/positions", params=params)
             if resp.status_code == 200:
                 raw_positions = resp.json().get("positions", [])
                 # แปลงให้ฟิลด์เข้ากันได้กับ MT5Integration เดิม
@@ -186,12 +205,6 @@ class RemoteMT5Bridge:
     ) -> Dict[str, Any]:
         """
         ส่งคำสั่งซื้อขายไปยัง MT5 บน VPS
-        - direction: 'BUY' หรือ 'SELL'
-        - lot: ขนาดสัญญา เช่น 0.01
-        - sl: ราคา Stop Loss
-        - tp: ราคา Take Profit
-        - entry: ราคา Limit/Stop หากไม่ใช่ Market
-        - force_market: True เพื่อเปิดทันทีที่ราคาตลาด
         """
         payload = {
             "direction": direction,
@@ -206,7 +219,7 @@ class RemoteMT5Bridge:
         }
         try:
             logging.info(f"📱 [Phone Engine] กำลังส่งคำสั่งเทรด -> VPS: {direction} {lot} {symbol}...")
-            resp = self.session.post(f"{self.vps_url}/api/order", json=payload, timeout=self.timeout)
+            resp = self._request("POST", "/api/order", json=payload)
             if resp.status_code == 200:
                 result = resp.json()
                 if result.get("status") == "SUCCESS":
@@ -227,7 +240,7 @@ class RemoteMT5Bridge:
         """ปิดออเดอร์ตาม Ticket ID"""
         try:
             payload = {"ticket": int(ticket), "symbol": symbol}
-            resp = self.session.post(f"{self.vps_url}/api/close", json=payload, timeout=self.timeout)
+            resp = self._request("POST", "/api/close", json=payload)
             if resp.status_code == 200:
                 return resp.json()
             return {"status": "ERROR", "message": resp.text}
@@ -242,7 +255,7 @@ class RemoteMT5Bridge:
                 "sl": float(new_sl) if new_sl is not None else None,
                 "tp": float(new_tp) if new_tp is not None else None
             }
-            resp = self.session.post(f"{self.vps_url}/api/modify", json=payload, timeout=self.timeout)
+            resp = self._request("POST", "/api/modify", json=payload)
             if resp.status_code == 200:
                 return resp.json()
             return {"status": "ERROR", "message": resp.text}
@@ -252,7 +265,7 @@ class RemoteMT5Bridge:
     def get_global_variable(self, name: str) -> Optional[float]:
         """ดึงค่าตัวแปร Global จาก MT5"""
         try:
-            resp = self.session.get(f"{self.vps_url}/api/global_variable", params={"name": name}, timeout=self.timeout)
+            resp = self._request("GET", "/api/global_variable", params={"name": name})
             if resp.status_code == 200:
                 return resp.json().get("value")
             return None
@@ -265,7 +278,7 @@ class RemoteMT5Bridge:
         ช่วยให้รู้ได้ทันทีว่าโบรกเกอร์มีคู่เงินทองคำตัวไหนเปิดให้เทรดบ้าง
         """
         try:
-            resp = self.session.get(f"{self.vps_url}/api/symbols", params={"search": search}, timeout=self.timeout)
+            resp = self._request("GET", "/api/symbols", params={"search": search})
             if resp.status_code == 200:
                 return resp.json().get("symbols", [])
             logging.error(f"❌ ดึงรายชื่อคู่เงินล้มเหลว: {resp.text}")
@@ -282,7 +295,7 @@ class RemoteMT5Bridge:
         """
         try:
             payload = {"mappings": {from_symbol.upper(): to_symbol.strip()}}
-            resp = self.session.post(f"{self.vps_url}/api/config/symbol_map", json=payload, timeout=self.timeout)
+            resp = self._request("POST", "/api/config/symbol_map", json=payload)
             if resp.status_code == 200:
                 logging.info(f"🎯 กำหนดคู่สัญลักษณ์สำเร็จ: {from_symbol} -> {to_symbol}")
                 return True
@@ -295,7 +308,7 @@ class RemoteMT5Bridge:
     def get_symbol_mappings(self) -> Dict[str, Any]:
         """ดึงดูตารางคู่สัญลักษณ์ที่กำหนดไว้ในปัจจุบัน"""
         try:
-            resp = self.session.get(f"{self.vps_url}/api/config/symbol_map", timeout=self.timeout)
+            resp = self._request("GET", "/api/config/symbol_map")
             if resp.status_code == 200:
                 return resp.json()
             return {}

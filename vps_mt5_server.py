@@ -757,5 +757,4 @@ def get_global_variable(name: str = Query(...), auth: str = Depends(verify_api_k
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 เริ่มต้น VPS MT5 Bridge Server บน Port {port}...")
-    uvicorn.run("vps_mt5_server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("vps_mt5_server:app", host="0.0.0.0", port=port, reload=False, timeout_keep_alive=65)
