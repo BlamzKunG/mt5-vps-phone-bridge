@@ -618,79 +618,132 @@ def send_order(req: OrderRequest, auth: str = Depends(verify_api_key)):
 @app.post("/api/close")
 def close_order(req: CloseRequest, auth: str = Depends(verify_api_key)):
     """ปิดออเดอร์ตาม Ticket ID"""
-    if not gateway.ensure_connected():
-        raise HTTPException(status_code=503, detail="MT5 not connected")
+    try:
+        if not gateway.ensure_connected():
+            raise HTTPException(status_code=503, detail="MT5 not connected")
 
-    positions = mt5.positions_get(ticket=req.ticket)
-    if not positions:
-        return {"status": "ERROR", "message": f"ไม่พบออเดอร์ Ticket {req.ticket} (อาจปิดไปแล้ว)"}
+        # ค้นหา Position ด้วย Ticket ID (มี Fallback สแกนทั้งหมดหาก MT5 ticket filter ไม่ตอบสนอง)
+        pos = None
+        positions = mt5.positions_get(ticket=int(req.ticket))
+        if positions and len(positions) > 0:
+            pos = positions[0]
+        else:
+            all_positions = mt5.positions_get()
+            if all_positions:
+                for p in all_positions:
+                    if p.ticket == int(req.ticket):
+                        pos = p
+                        break
 
-    pos = positions[0]
-    close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    sym_info = mt5.symbol_info(pos.symbol)
-    initial_filling = gateway.get_filling_mode(sym_info) if sym_info else mt5.ORDER_FILLING_IOC
+        if not pos:
+            return {"status": "ERROR", "message": f"ไม่พบออเดอร์ Ticket {req.ticket} ในระบบ (อาจถูกปิดหรือชน SL/TP ไปแล้ว)"}
 
-    close_req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "position": pos.ticket,
-        "symbol": pos.symbol,
-        "volume": pos.volume,
-        "type": close_type,
-        "price": close_price,
-        "deviation": 20,
-        "magic": pos.magic,
-        "comment": "LLM Close",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": initial_filling,
-    }
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        sym_info = mt5.symbol_info(pos.symbol)
+        initial_filling = gateway.get_filling_mode(sym_info) if sym_info else mt5.ORDER_FILLING_IOC
 
-    result = gateway.execute_with_fill_retry(close_req)
-    if result is None:
-        err_msg = f"mt5.order_send() คืนค่า None รหัสข้อผิดพลาด: {mt5.last_error()}"
-        logger.error(err_msg)
-        return {"status": "FAILED", "message": err_msg}
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if not tick:
+            return {"status": "ERROR", "message": f"ไม่สามารถดึงราคาปัจจุบันของ {pos.symbol} ได้"}
+        close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        err_msg = f"ปิดออเดอร์ {req.ticket} ไม่สำเร็จ: {result.comment} (code: {result.retcode})"
-        logger.error(err_msg)
-        return {"status": "FAILED", "message": err_msg}
+        close_req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": int(pos.ticket),
+            "symbol": pos.symbol,
+            "volume": float(pos.volume),
+            "type": close_type,
+            "price": float(close_price),
+            "deviation": 20,
+            "magic": int(pos.magic),
+            "comment": "LLM Close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": initial_filling,
+        }
 
-    logger.info(f"✅ ปิดออเดอร์ Ticket {req.ticket} สำเร็จ")
-    return {"status": "SUCCESS", "ticket": req.ticket, "message": "Position closed successfully"}
+        result = gateway.execute_with_fill_retry(close_req)
+        if result is None:
+            err_msg = f"mt5.order_send() คืนค่า None รหัสข้อผิดพลาด: {mt5.last_error()}"
+            logger.error(err_msg)
+            return {"status": "FAILED", "message": err_msg}
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            err_msg = f"ปิดออเดอร์ {req.ticket} ไม่สำเร็จ: {result.comment} (code: {result.retcode})"
+            logger.error(err_msg)
+            return {"status": "FAILED", "message": err_msg}
+
+        logger.info(f"✅ ปิดออเดอร์ Ticket {req.ticket} สำเร็จ")
+        return {"status": "SUCCESS", "ticket": req.ticket, "message": "Position closed successfully"}
+    except Exception as e:
+        logger.exception(f"❌ เกิดข้อผิดพลาดใน close_order: {e}")
+        return {"status": "ERROR", "message": str(e)}
 
 @app.post("/api/modify")
 def modify_order(req: ModifyRequest, auth: str = Depends(verify_api_key)):
     """ปรับแก้ Stop Loss หรือ Take Profit"""
-    if not gateway.ensure_connected():
-        raise HTTPException(status_code=503, detail="MT5 not connected")
+    try:
+        if not gateway.ensure_connected():
+            raise HTTPException(status_code=503, detail="MT5 not connected")
 
-    positions = mt5.positions_get(ticket=req.ticket)
-    if not positions:
-        return {"status": "ERROR", "message": f"ไม่พบออเดอร์ Ticket {req.ticket}"}
+        # ค้นหา Position ด้วย Ticket ID (มี Fallback สแกนทั้งหมด)
+        pos = None
+        positions = mt5.positions_get(ticket=int(req.ticket))
+        if positions and len(positions) > 0:
+            pos = positions[0]
+        else:
+            all_positions = mt5.positions_get()
+            if all_positions:
+                for p in all_positions:
+                    if p.ticket == int(req.ticket):
+                        pos = p
+                        break
 
-    pos = positions[0]
-    sym_info = mt5.symbol_info(pos.symbol)
-    digits = sym_info.digits if sym_info else 2
-    tick_size = sym_info.trade_tick_size if sym_info else 0.01
+        if not pos:
+            return {"status": "ERROR", "message": f"ไม่พบออเดอร์ Ticket {req.ticket} ในระบบ"}
 
-    new_sl = round(round(float(req.sl) / tick_size) * tick_size, digits) if req.sl is not None else pos.sl
-    new_tp = round(round(float(req.tp) / tick_size) * tick_size, digits) if req.tp is not None else pos.tp
+        sym_info = mt5.symbol_info(pos.symbol)
+        digits = sym_info.digits if sym_info else 2
+        tick_size = sym_info.trade_tick_size if sym_info else 0.01
 
-    mod_req = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "position": pos.ticket,
-        "symbol": pos.symbol,
-        "sl": new_sl,
-        "tp": new_tp,
-    }
+        new_sl = round(round(float(req.sl) / tick_size) * tick_size, digits) if req.sl is not None else float(pos.sl)
+        new_tp = round(round(float(req.tp) / tick_size) * tick_size, digits) if req.tp is not None else float(pos.tp)
 
-    result = mt5.order_send(mod_req)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        err_msg = f"แก้ไข SL/TP {req.ticket} ไม่สำเร็จ: {result.comment} (code: {result.retcode})"
-        logger.error(err_msg)
-        return {"status": "FAILED", "message": err_msg}
+        mod_req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(pos.ticket),
+            "symbol": pos.symbol,
+            "sl": float(new_sl),
+            "tp": float(new_tp),
+        }
 
-    return {"status": "SUCCESS", "ticket": req.ticket, "sl": new_sl, "tp": new_tp}
+        result = mt5.order_send(mod_req)
+        # หากบางโบรกเกอร์ปฏิเสธคำสั่งที่มีฟิลด์ 'symbol' ให้ลองส่งแบบไม่มี 'symbol'
+        if result is None or (result.retcode != mt5.TRADE_RETCODE_DONE and "symbol" in mod_req):
+            mod_req_fallback = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": int(pos.ticket),
+                "sl": float(new_sl),
+                "tp": float(new_tp),
+            }
+            res_alt = mt5.order_send(mod_req_fallback)
+            if res_alt is not None and res_alt.retcode == mt5.TRADE_RETCODE_DONE:
+                result = res_alt
+
+        if result is None:
+            err_msg = f"mt5.order_send() คืนค่า None รหัสข้อผิดพลาด: {mt5.last_error()}"
+            logger.error(err_msg)
+            return {"status": "FAILED", "message": err_msg}
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            err_msg = f"แก้ไข SL/TP {req.ticket} ไม่สำเร็จ: {result.comment} (code: {result.retcode})"
+            logger.error(err_msg)
+            return {"status": "FAILED", "message": err_msg}
+
+        logger.info(f"✅ แก้ไข SL/TP Ticket {req.ticket} สำเร็จ: SL={new_sl}, TP={new_tp}")
+        return {"status": "SUCCESS", "ticket": req.ticket, "sl": new_sl, "tp": new_tp}
+    except Exception as e:
+        logger.exception(f"❌ เกิดข้อผิดพลาดใน modify_order: {e}")
+        return {"status": "ERROR", "message": str(e)}
 
 @app.get("/api/global_variable")
 def get_global_variable(name: str = Query(...), auth: str = Depends(verify_api_key)):
