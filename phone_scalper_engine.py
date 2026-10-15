@@ -14,7 +14,7 @@ import sys
 import time
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple
 import pandas as pd
 import requests
@@ -316,8 +316,9 @@ Analyze the market structure and output your pure JSON scalping decision:"""
         """
         ทำงาน 1 รอบวัฏจักร (Single Cycle)
         """
+        local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.info("=" * 60)
-        logging.info(f"🔄 เริ่มรอบการทำงาน: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        logging.info(f"🔄 เริ่มรอบการทำงาน: {local_time_str} (เวลาเครื่อง)")
         
         ctx = self.prepare_market_context()
         if not ctx:
@@ -340,33 +341,50 @@ Analyze the market structure and output your pure JSON scalping decision:"""
         success = self.execute_decision(decision)
         return success
 
-    def run_forever(self):
+    def run_forever(self, run_immediately: bool = True):
         """
-        รันระบบอัตโนมัติต่อเนื่อง Sync ตามการปิดแท่งเทียน M5 ทุก 5 นาที
+        รันระบบอัตโนมัติต่อเนื่อง 24/7 โดยซิงค์ตามเวลาเครื่องโทรศัพท์ทุก 5 นาทีเป๊ะ
+        เช่น 01:00, 01:05, 01:10, 01:15, ... (+ 1 วินาที buffer ให้แท่งปิดสมบูรณ์)
         """
-        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 ซิงค์ทุกแท่งเทียน M5 ปิด...")
+        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (ซิงค์เวลาโทรศัพท์ทุก 5 นาที)")
+        
+        if run_immediately:
+            logging.info("⚡ รันรอบแรกทันทีเมื่อสตาร์ท...")
+            self.run_single_cycle()
+
         while True:
             try:
-                # คำนวณเวลานาทีถัดไปที่แท่ง 5 นาทีจะปิด (:00, :05, :10, :15, ...)
-                now = datetime.now(timezone.utc)
-                minutes_past = now.minute % 5
-                seconds_past = minutes_past * 60 + now.second
-                seconds_to_wait = (5 * 60) - seconds_past + 2  # บวก buffer 2 วินาทีเพื่อให้แท่งปิดสนิท
+                now = datetime.now()
+                # คำนวณเวลาเป้าหมายถัดไปที่ลงท้ายด้วย 0 หรือ 5 นาที (เช่น :05, :10, :15, ...)
+                minutes_to_add = 5 - (now.minute % 5)
+                target_time = (now + timedelta(minutes=minutes_to_add)).replace(second=1, microsecond=0)
+                
+                wait_seconds = (target_time - now).total_seconds()
+                # เผื่อกรณีคลาดเคลื่อน
+                if wait_seconds <= 0:
+                    wait_seconds += 300
+                    target_time += timedelta(minutes=5)
 
-                logging.info(f"⏳ รอแท่ง M5 ถัดไปปิดในอีก {seconds_to_wait // 60} นาที {seconds_to_wait % 60} วินาที...")
-                time.sleep(seconds_to_wait)
+                wait_m = int(wait_seconds) // 60
+                wait_s = int(wait_seconds) % 60
+                logging.info(f"⏰ เวลาเครื่อง: {now.strftime('%H:%M:%S')} -> รอบถัดไปคือ {target_time.strftime('%H:%M:%S')} (รออีก {wait_m} นาที {wait_s} วินาที)...")
+                
+                time.sleep(wait_seconds)
 
-                # รันวัฏจักร
+                # ดำเนินการเรียก AI วิเคราะห์แท่งเทียน
                 self.run_single_cycle()
 
             except KeyboardInterrupt:
-                logging.info("\n🛑 ผู้ใช้หยุดการทำงานของระบบ")
+                logging.info("\n🛑 ผู้ใช้หยุดการทำงานของระบบ (Ctrl+C)")
                 break
             except Exception as e:
                 logging.error(f"❌ เกิดข้อผิดพลาดใน Loop: {e}")
-                time.sleep(10)
+                time.sleep(5)
 
 if __name__ == "__main__":
+    once = "--once" in sys.argv
     engine = PriceActionScalperEngine(dry_run=False)
-    # ทดสอบรัน 1 cycle ทันทีเมื่อสตาร์ท
-    engine.run_single_cycle()
+    if once:
+        engine.run_single_cycle()
+    else:
+        engine.run_forever(run_immediately=True)
