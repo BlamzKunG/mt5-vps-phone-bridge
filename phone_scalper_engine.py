@@ -241,8 +241,12 @@ Analyze the market structure and output your pure JSON scalping decision:"""
             logging.warning(f"⚠️ Spread สูงเกินเกณฑ์ ({spread_points} > {self.max_spread_points}) -> ข้ามรอบนี้")
             return False
 
-        # 2. ตรวจสอบ Open Positions เพื่อไม่ให้เทรดซ้ำซ้อน
-        open_positions = self.bridge.get_positions(symbol=self.symbol)
+        # 2. ตรวจสอบ Open Positions เพื่อไม่ให้เทรดซ้ำซ้อน (รองรับทั้ง get_positions และ get_open_positions)
+        if hasattr(self.bridge, "get_positions"):
+            open_positions = self.bridge.get_positions(symbol=self.symbol)
+        else:
+            open_positions = self.bridge.get_open_positions(symbol=self.symbol)
+
         if action == "CLOSE_ALL":
             if open_positions:
                 logging.info(f"🧹 กำลังปิด Position ทั้งหมด {len(open_positions)} รายการตามคำสั่ง AI...")
@@ -281,15 +285,25 @@ Analyze the market structure and output your pure JSON scalping decision:"""
             logging.info(f"🧪 [DRY RUN] จำลองส่งออเดอร์สำเร็จ: {action} {self.lot_size} lot @ {entry_price}")
             return True
 
-        # ส่งออเดอร์ไปยัง MT5 Bridge
-        result = self.bridge.send_order(
-            action=action,
-            symbol=self.symbol,
-            volume=self.lot_size,
-            sl=sl_price,
-            tp=tp_price,
-            comment=f"Scalp-{action[:1]}-{sl_points}/{tp_points}"
-        )
+        # ส่งออเดอร์ไปยัง MT5 Bridge (รองรับทั้ง send_order และ open_position)
+        if hasattr(self.bridge, "send_order"):
+            result = self.bridge.send_order(
+                action=action,
+                symbol=self.symbol,
+                volume=self.lot_size,
+                sl=sl_price,
+                tp=tp_price,
+                comment=f"Scalp-{action[:1]}-{sl_points}/{tp_points}"
+            )
+        else:
+            result = self.bridge.open_position(
+                direction=action,
+                lot=self.lot_size,
+                sl=sl_price,
+                tp=tp_price,
+                symbol=self.symbol,
+                comment=f"Scalp-{action[:1]}-{sl_points}/{tp_points}"
+            )
 
         if result and result.get("status") == "SUCCESS":
             logging.info(f"✅ เปิดออเดอร์สำเร็จ! Ticket: {result.get('ticket')}")
