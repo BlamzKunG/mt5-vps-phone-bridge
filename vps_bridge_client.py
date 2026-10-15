@@ -175,6 +175,7 @@ class RemoteMT5Bridge:
                 for p in raw_positions:
                     positions_list.append({
                         "id": p["ticket"],
+                        "ticket": p["ticket"],
                         "direction": p["direction"],
                         "lot": p["volume"],
                         "entry_price": p["open_price"],
@@ -190,6 +191,22 @@ class RemoteMT5Bridge:
         except Exception as e:
             logging.error(f"❌ ไม่สามารถดึงรายการออเดอร์ได้: {e}")
             return []
+
+    def get_positions(self, symbol: Optional[str] = "XAUUSD", magic: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Alias สำหรับ get_open_positions"""
+        return self.get_open_positions(symbol=symbol, magic=magic)
+
+    def send_order(
+        self,
+        action: str,
+        symbol: str = "XAUUSD",
+        volume: float = 0.01,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+        comment: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Alias สำหรับ open_position"""
+        return self.open_position(direction=action, lot=volume, sl=sl, tp=tp, symbol=symbol, comment=comment)
 
     def open_position(
         self,

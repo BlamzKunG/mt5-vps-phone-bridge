@@ -247,7 +247,9 @@ Analyze the market structure and output your pure JSON scalping decision:"""
             if open_positions:
                 logging.info(f"🧹 กำลังปิด Position ทั้งหมด {len(open_positions)} รายการตามคำสั่ง AI...")
                 for pos in open_positions:
-                    self.bridge.close_position(ticket=pos["ticket"])
+                    t_id = pos.get("ticket") or pos.get("id")
+                    if t_id:
+                        self.bridge.close_position(ticket=t_id, symbol=self.symbol)
             return True
 
         if len(open_positions) >= 1:
