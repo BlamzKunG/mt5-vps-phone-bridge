@@ -283,6 +283,8 @@ class CloseRequest(BaseModel):
 class ModifyRequest(BaseModel):
     ticket: int = Field(..., description="Order Ticket ID")
     sl: Optional[float] = Field(None, description="Stop Loss ใหม่")
+    tp: Optional[float] = Field(None, description="Take Profit ใหม่")
+
 class SymbolMapRequest(BaseModel):
     mappings: Dict[str, str] = Field(..., description="พจนานุกรมจับคู่สัญลักษณ์ เช่น {'XAUUSD': 'XAUUSD247'}")
 
