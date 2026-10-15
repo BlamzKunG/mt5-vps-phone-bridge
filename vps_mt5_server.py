@@ -89,11 +89,30 @@ class MT5Gateway:
             return False
         if self.initialized:
             # ตรวจสอบสถานะการเชื่อมต่อ
-            if mt5.terminal_info() is not None:
+            term = mt5.terminal_info()
+            if term is not None and getattr(term, "connected", False):
                 return True
-            logger.warning("⚠️ Terminal หลุดการเชื่อมต่อ กำลังลองเชื่อมต่อใหม่...")
+            logger.warning("⚠️ Terminal หลุดการเชื่อมต่อหรือเน็ตหลุด กำลังลองเชื่อมต่อใหม่...")
 
-        if not mt5.initialize():
+        # ดึงค่าล็อกอินอัตโนมัติจาก Environment (หากมีกำหนดไว้)
+        login = os.environ.get("MT5_LOGIN")
+        password = os.environ.get("MT5_PASSWORD")
+        server = os.environ.get("MT5_SERVER")
+        path = os.environ.get("MT5_PATH")
+
+        init_kwargs = {}
+        if path:
+            init_kwargs["path"] = path
+        if login and password and server:
+            try:
+                init_kwargs["login"] = int(login)
+                init_kwargs["password"] = password
+                init_kwargs["server"] = server
+                logger.info(f"🔑 กำลังล็อกอินเข้า MT5 อัตโนมัติ: บัญชี {login} @ {server}...")
+            except ValueError:
+                logger.warning(f"⚠️ MT5_LOGIN ไม่ถูกต้อง ({login}) ต้องเป็นตัวเลขเท่านั้น")
+
+        if not mt5.initialize(**init_kwargs):
             logger.error(f"❌ mt5.initialize() ล้มเหลว: {mt5.last_error()}")
             self.initialized = False
             return False
@@ -102,6 +121,43 @@ class MT5Gateway:
         term_info = mt5.terminal_info()
         logger.info(f"✅ เชื่อมต่อ MT5 Terminal สำเร็จ: Connected={term_info.connected if term_info else False}")
         return True
+
+    def get_filling_mode(self, sym_info) -> int:
+        """ตรวจหา Filling Mode ที่เหมาะสมจากคู่เงินของโบรกเกอร์ (IOC, FOK, RETURN)"""
+        filling_mode = getattr(sym_info, "filling_mode", 0)
+        # Bit 2 = IOC (Immediate Or Cancel)
+        if filling_mode & 2:
+            return mt5.ORDER_FILLING_IOC
+        # Bit 1 = FOK (Fill Or Kill)
+        elif filling_mode & 1:
+            return mt5.ORDER_FILLING_FOK
+        else:
+            return mt5.ORDER_FILLING_RETURN
+
+    def execute_with_fill_retry(self, request_dict: dict) -> Any:
+        """
+        ส่งคำสั่งซื้อขายและลองสลับ Filling Mode อัตโนมัติ
+        ป้องกันข้อผิดพลาด 10030 (Unsupported filling mode) ซึ่งพบบ่อยในบัญชี ECN/Raw/Cent
+        """
+        initial_mode = request_dict.get("type_filling", mt5.ORDER_FILLING_IOC)
+        modes_to_try = [initial_mode]
+        for alt in [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC]:
+            if alt not in modes_to_try:
+                modes_to_try.append(alt)
+
+        last_res = None
+        for mode in modes_to_try:
+            request_dict["type_filling"] = mode
+            last_res = mt5.order_send(request_dict)
+            if last_res is not None and last_res.retcode == mt5.TRADE_RETCODE_DONE:
+                return last_res
+            # retcode 10030 = TRADE_RETCODE_INVALID_FILL
+            if last_res is not None and last_res.retcode == 10030:
+                logger.warning(f"⚠️ โบรกเกอร์ไม่รองรับ Filling Mode {mode} กำลังลองโหมดสำรองถัดไป...")
+                continue
+            # หากติด Error อื่น (เช่น Margin ไม่พอ, ตลาดปิด) ให้หยุดทันที ไม่ส่งซ้ำ
+            break
+        return last_res
 
     def resolve_symbol(self, symbol: str) -> str:
         """
@@ -500,6 +556,7 @@ def send_order(req: OrderRequest, auth: str = Depends(verify_api_key)):
             if final_tp > 0.0 and final_tp >= target_price:
                 final_tp = 0.0
 
+        initial_filling = gateway.get_filling_mode(sym_info)
         trade_request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": real_sym,
@@ -512,7 +569,7 @@ def send_order(req: OrderRequest, auth: str = Depends(verify_api_key)):
             "magic": int(req.magic),
             "comment": req.comment or "LLM Trade",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": initial_filling,
         }
     else:
         # Pending Order
@@ -537,7 +594,7 @@ def send_order(req: OrderRequest, auth: str = Depends(verify_api_key)):
         }
 
     logger.info(f"📤 กำลังส่งคำสั่งไป MT5: {direction} {req.lot} lot บน {real_sym} (Price={target_price}, SL={final_sl}, TP={final_tp})")
-    result = mt5.order_send(trade_request)
+    result = gateway.execute_with_fill_retry(trade_request)
 
     if result is None:
         err_msg = f"mt5.order_send() คืนค่า None รหัสข้อผิดพลาด: {mt5.last_error()}"
@@ -570,8 +627,8 @@ def close_order(req: CloseRequest, auth: str = Depends(verify_api_key)):
 
     pos = positions[0]
     close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    tick = mt5.symbol_info_tick(pos.symbol)
-    close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+    sym_info = mt5.symbol_info(pos.symbol)
+    initial_filling = gateway.get_filling_mode(sym_info) if sym_info else mt5.ORDER_FILLING_IOC
 
     close_req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -584,10 +641,15 @@ def close_order(req: CloseRequest, auth: str = Depends(verify_api_key)):
         "magic": pos.magic,
         "comment": "LLM Close",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": initial_filling,
     }
 
-    result = mt5.order_send(close_req)
+    result = gateway.execute_with_fill_retry(close_req)
+    if result is None:
+        err_msg = f"mt5.order_send() คืนค่า None รหัสข้อผิดพลาด: {mt5.last_error()}"
+        logger.error(err_msg)
+        return {"status": "FAILED", "message": err_msg}
+
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         err_msg = f"ปิดออเดอร์ {req.ticket} ไม่สำเร็จ: {result.comment} (code: {result.retcode})"
         logger.error(err_msg)
