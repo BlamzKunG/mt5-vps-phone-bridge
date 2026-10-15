@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+M5 Price Action Scalper - Rich CLI Dashboard
+--------------------------------------------
+Realtime Terminal Dashboard for Termux / Linux
+- Live second-by-second countdown to next M5 candle close
+- Live Bid/Ask/Spread tracker from VPS MT5
+- AI Decision display (Action, Confidence, Regime, Reasoning)
+- 100-Bar Normalized level bar & recent 5 candles table
+- Active Position & Trade History tracker
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.live import Live
+from rich import box
+from rich.align import Align
+
+# Import our robust scalper engine & bridge
+from phone_scalper_engine import PriceActionScalperEngine
+
+# Redirect root logging so it doesn't corrupt the Rich TUI screen
+logging.getLogger().handlers = [logging.FileHandler("scalper_dashboard.log", encoding="utf-8")]
+
+class ScalperCLIDashboard:
+    def __init__(self, dry_run: bool = False):
+        self.console = Console()
+        self.engine = PriceActionScalperEngine(dry_run=dry_run)
+        self.dry_run = dry_run
+
+        self.last_decision: Optional[Dict[str, Any]] = None
+        self.last_context: Optional[Dict[str, Any]] = None
+        self.trade_history: List[Dict[str, Any]] = []
+        self.active_position: Optional[Dict[str, Any]] = None
+        self.live_price: Optional[Dict[str, Any]] = None
+        self.is_analyzing: bool = False
+        self.status_message: str = "พร้อมทำงาน - กำลังรอแท่งเทียนถัดไป..."
+        self.last_processed_slot: Optional[str] = None
+
+    def fetch_live_status(self):
+        """ดึงราคาและ Position ล่าสุดจาก MT5"""
+        try:
+            self.live_price = self.engine.bridge.get_current_price(symbol=self.engine.symbol)
+            if hasattr(self.engine.bridge, "get_positions"):
+                positions = self.engine.bridge.get_positions(symbol=self.engine.symbol)
+            else:
+                positions = self.engine.bridge.get_open_positions(symbol=self.engine.symbol)
+            self.active_position = positions[0] if positions else None
+        except Exception as e:
+            self.status_message = f"เชื่อมต่อ VPS ขัดข้อง: {e}"
+
+    def trigger_ai_cycle(self):
+        """เรียก AI วิเคราะห์แท่งเทียนรอบใหม่"""
+        self.is_analyzing = True
+        self.status_message = "🤖 กำลังส่งแท่งเทียนให้ gpt-6-sol (effort: xhigh) คิดวิเคราะห์..."
+        try:
+            ctx = self.engine.prepare_market_context()
+            if not ctx:
+                self.status_message = "❌ ข้อมูลไม่พร้อม ข้ามรอบนี้"
+                self.is_analyzing = False
+                return
+
+            self.last_context = ctx
+            decision = self.engine.call_ai_decision(ctx)
+            if decision:
+                self.last_decision = decision
+                action = decision.get("action", "HOLD").upper()
+                self.status_message = f"✅ AI ตัดสินใจ: {action} (ความมั่นใจ {decision.get('confidence', 0):.0%})"
+                
+                # ทำการส่งคำสั่งผ่าน Safety Guard
+                executed = self.engine.execute_decision(decision)
+                
+                # บันทึกประวัติ
+                self.trade_history.insert(0, {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "action": action,
+                    "confidence": decision.get("confidence", 0),
+                    "price": ctx.get("current_price", 0),
+                    "sl": decision.get("sl_points", 0),
+                    "tp": decision.get("tp_points", 0),
+                    "status": "EXECUTED" if executed else "SKIPPED/HOLD"
+                })
+                if len(self.trade_history) > 6:
+                    self.trade_history.pop()
+            else:
+                self.status_message = "❌ ไม่ได้รับคำตอบจาก AI"
+        except Exception as e:
+            self.status_message = f"❌ Error ระหว่าง AI Cycle: {e}"
+        finally:
+            self.is_analyzing = False
+
+    def build_layout(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="top_metrics", size=6),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=3)
+        )
+        layout["main"].split_row(
+            Layout(name="ai_panel", ratio=6),
+            Layout(name="market_panel", ratio=4)
+        )
+        return layout
+
+    def render(self) -> Layout:
+        layout = self.build_layout()
+        now = datetime.now()
+
+        # 1. Header
+        header_text = Text()
+        header_text.append(" ⚡ AI QUANTITATIVE SCALPER (M5) ", style="bold white on blue")
+        header_text.append("  |  ", style="dim")
+        header_text.append(f"Model: {self.engine.model} (effort: {self.engine.reasoning_effort})", style="bold cyan")
+        header_text.append("  |  ", style="dim")
+        header_text.append(f"Asset: {self.engine.symbol}", style="bold yellow")
+        header_text.append("  |  ", style="dim")
+        header_text.append("● ONLINE", style="bold green")
+        layout["header"].update(Panel(Align.center(header_text), box=box.ROUNDED, style="blue"))
+
+        # 2. Top Metrics (Price, Spread, Countdown, Position)
+        metrics_table = Table.grid(expand=True)
+        metrics_table.add_column(ratio=2)
+        metrics_table.add_column(ratio=2)
+        metrics_table.add_column(ratio=3)
+        metrics_table.add_column(ratio=3)
+
+        # Price & Spread
+        bid = self.live_price.get("bid", 0.0) if self.live_price else 0.0
+        ask = self.live_price.get("ask", 0.0) if self.live_price else 0.0
+        spread = self.live_price.get("spread", 0.0) if self.live_price else 0.0
+        spread_color = "green" if spread < 30 else ("yellow" if spread <= 40 else "red")
+
+        p_price = Panel(
+            f"[bold white]{bid:.2f}[/] / [dim]{ask:.2f}[/]\nSpread: [{spread_color}]{spread:.1f} pts[/]",
+            title="[bold]💵 LIVE MARKET[/]", box=box.ROUNDED, border_style="cyan"
+        )
+
+        # 100-Bar Macro Level Bar
+        min_100 = self.last_context.get("min_100", 0) if self.last_context else 0
+        max_100 = self.last_context.get("max_100", 0) if self.last_context else 0
+        cur_price = self.last_context.get("current_price", bid) if self.last_context else bid
+        if max_100 > min_100 and cur_price > 0:
+            norm_val = max(0.0, min(1.0, (cur_price - min_100) / (max_100 - min_100)))
+            bars_filled = int(norm_val * 15)
+            bar_graph = "█" * bars_filled + "░" * (15 - bars_filled)
+            macro_desc = f"[{bar_graph}] {norm_val:.2f}\nLow: {min_100:.1f} | High: {max_100:.1f}"
+        else:
+            macro_desc = "กำลังประมวลผลข้อมูล..."
+
+        p_macro = Panel(macro_desc, title="[bold]📊 100-BAR LEVEL[/]", box=box.ROUNDED, border_style="magenta")
+
+        # Countdown to next M5
+        minutes_to_add = 5 - (now.minute % 5)
+        target_time = (now + timedelta(minutes=minutes_to_add)).replace(second=1, microsecond=0)
+        wait_seconds = max(0, int((target_time - now).total_seconds()))
+        wait_m = wait_seconds // 60
+        wait_s = wait_seconds % 60
+        timer_color = "bold green" if wait_seconds > 30 else "bold red blink"
+
+        if self.is_analyzing:
+            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nกรุณารอสักครู่ (~30s)"
+        else:
+            timer_text = f"[{timer_color}]{wait_m:02d}:{wait_s:02d}[/] น.\nรอบถัดไป: {target_time.strftime('%H:%M:%S')}"
+
+        p_timer = Panel(timer_text, title="[bold]⏰ NEXT M5 CANDLE[/]", box=box.ROUNDED, border_style="yellow")
+
+        # Active Position
+        if self.active_position:
+            p_dir = self.active_position.get("direction", "N/A")
+            p_lot = self.active_position.get("lot", 0.01)
+            p_entry = self.active_position.get("entry_price", 0.0)
+            p_pnl = self.active_position.get("pnl", 0.0)
+            pnl_color = "bold green" if p_pnl >= 0 else "bold red"
+            pos_text = f"[bold]{p_dir} {p_lot} lot[/] @ {p_entry:.2f}\nFloating PnL: [{pnl_color}]{p_pnl:+.2f} USD[/]"
+            pos_border = "green" if p_pnl >= 0 else "red"
+        else:
+            pos_text = "[dim]ไม่มีออเดอร์เปิดค้าง[/]\n(Scalp 100-500 pts)"
+            pos_border = "dim white"
+
+        p_pos = Panel(pos_text, title="[bold]💼 ACTIVE POSITION[/]", box=box.ROUNDED, border_style=pos_border)
+
+        metrics_table.add_row(p_price, p_macro, p_timer, p_pos)
+        layout["top_metrics"].update(metrics_table)
+
+        # 3. Main - Left: AI Decision Panel
+        if self.last_decision:
+            action = self.last_decision.get("action", "HOLD").upper()
+            conf = self.last_decision.get("confidence", 0.0)
+            sl_pts = self.last_decision.get("sl_points", 0)
+            tp_pts = self.last_decision.get("tp_points", 0)
+            regime = self.last_decision.get("market_regime", "N/A")
+            reasoning = self.last_decision.get("reasoning", "No rationale provided")
+
+            action_color = "bold white on green" if action == "BUY" else ("bold white on red" if action == "SELL" else "bold black on yellow")
+            decision_text = Text()
+            decision_text.append(f" ACTION: {action} ", style=action_color)
+            decision_text.append(f"  Confidence: {conf:.0%}  |  Regime: {regime}\n", style="bold cyan")
+            decision_text.append(f"  SL: {sl_pts} pts ({sl_pts*0.01:.2f} USD)  |  TP: {tp_pts} pts ({tp_pts*0.01:.2f} USD)\n\n", style="bold yellow")
+            decision_text.append("🧠 Deep Quantitative Rationale:\n", style="bold underline")
+            decision_text.append(reasoning, style="italic text")
+
+            ai_panel_border = "green" if action == "BUY" else ("red" if action == "SELL" else "yellow")
+        else:
+            decision_text = Text("\n\n   กำลังเตรียมข้อมูลเพื่อเริ่มการวิเคราะห์รอบแรก...", style="dim")
+            ai_panel_border = "blue"
+
+        layout["ai_panel"].update(Panel(decision_text, title="[bold]🧠 GPT-6-SOL INTELLIGENCE[/]", box=box.ROUNDED, border_style=ai_panel_border))
+
+        # 4. Main - Right: Recent M5 Candles & Trade History
+        right_table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False)
+        right_table.add_column("Time", justify="center", style="cyan")
+        right_table.add_column("Action", justify="center")
+        right_table.add_column("Price", justify="right")
+        right_table.add_column("SL/TP", justify="center")
+        right_table.add_column("Status", justify="right")
+
+        for h in self.trade_history:
+            act = h["action"]
+            act_style = "green" if act == "BUY" else ("red" if act == "SELL" else "yellow")
+            right_table.add_row(
+                h["time"],
+                f"[{act_style}]{act}[/]",
+                f"{h['price']:.2f}",
+                f"{h['sl']}/{h['tp']}",
+                f"[dim]{h['status']}[/]"
+            )
+
+        if not self.trade_history:
+            right_table.add_row("-", "[dim]รอประวัติรอบแรก[/]", "-", "-", "-")
+
+        layout["market_panel"].update(Panel(right_table, title="[bold]📜 RECENT TRADE JOURNAL[/]", box=box.ROUNDED, border_style="cyan"))
+
+        # 5. Footer (Status Bar & Hotkeys)
+        footer_text = Text()
+        footer_text.append(f" ℹ️  สถานะ: {self.status_message} ", style="bold white")
+        footer_text.append("  |  ", style="dim")
+        footer_text.append("กด Ctrl+C เพื่อออกจาก Dashboard", style="dim italic")
+        layout["footer"].update(Panel(footer_text, box=box.ROUNDED, style="dim white"))
+
+        return layout
+
+    def start(self):
+        """ลูปหลักของ Live Dashboard"""
+        self.console.clear()
+        self.fetch_live_status()
+
+        # รันรอบแรกทันทีเมื่อสตาร์ท
+        self.trigger_ai_cycle()
+
+        with Live(self.render(), console=self.console, refresh_per_second=2, screen=True) as live:
+            tick_counter = 0
+            while True:
+                try:
+                    time.sleep(0.5)
+                    tick_counter += 1
+                    now = datetime.now()
+
+                    # ดึงสถานะราคาและพอร์ตทุก 3 วินาที
+                    if tick_counter % 6 == 0 and not self.is_analyzing:
+                        self.fetch_live_status()
+
+                    # ตรวจสอบว่าถึงเวลาแท่ง M5 ปิดหรือยัง (:00, :05, :10, :15, ...)
+                    current_slot = f"{now.strftime('%H')}:{(now.minute // 5) * 5:02d}"
+                    is_exact_5min = (now.minute % 5 == 0) and (now.second in [1, 2, 3])
+
+                    if is_exact_5min and current_slot != self.last_processed_slot and not self.is_analyzing:
+                        self.last_processed_slot = current_slot
+                        live.update(self.render())
+                        self.trigger_ai_cycle()
+
+                    live.update(self.render())
+
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    self.status_message = f"Error: {e}"
+
+        self.console.clear()
+        self.console.print("\n[bold yellow]🛑 ปิด Dashboard เรียบร้อยแล้ว[/]\n")
+
+if __name__ == "__main__":
+    dry = "--dry" in sys.argv
+    dashboard = ScalperCLIDashboard(dry_run=dry)
+    dashboard.start()
