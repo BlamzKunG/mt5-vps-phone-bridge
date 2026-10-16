@@ -7,6 +7,7 @@ Realtime Terminal Dashboard for Termux / Linux
 - Live Bid/Ask/Spread tracker from VPS MT5
 - AI Decision display (Action, Confidence, Regime, Reasoning)
 - Supports Active Trade Management (HOLD_POSITION, MODIFY_SLTP, CLOSE_POSITION)
+- Emergency Consensus Display: gpt-6-luna x2 Dual Verification
 - 100-Bar Normalized level bar & recent candles
 - Active Position with SL/TP & Floating PnL
 - Recent Trade Journal
@@ -65,7 +66,7 @@ class ScalperCLIDashboard:
     def trigger_ai_cycle(self):
         """เรียก AI วิเคราะห์แท่งเทียนรอบใหม่"""
         self.is_analyzing = True
-        self.status_message = "🤖 กำลังส่งแท่งเทียนให้ gpt-6-sol (effort: xhigh) คิดวิเคราะห์..."
+        self.status_message = f"🤖 กำลังวิเคราะห์แท่งเทียน (Primary: {self.engine.model} / Emergency: {self.engine.fallback_model} x2)..."
         try:
             ctx = self.engine.prepare_market_context()
             if not ctx:
@@ -78,7 +79,8 @@ class ScalperCLIDashboard:
             if decision:
                 self.last_decision = decision
                 action = decision.get("action", "HOLD").upper()
-                self.status_message = f"✅ AI ตัดสินใจ: {action} (ความมั่นใจ {decision.get('confidence', 0):.0%})"
+                model_used = decision.get("model_used", self.engine.model)
+                self.status_message = f"✅ AI ตัดสินใจ: {action} ({model_used})"
                 
                 # ทำการส่งคำสั่งผ่าน Safety Guard พร้อมส่ง context เพื่อจัดการ Active Trade
                 executed = self.engine.execute_decision(decision, ctx)
@@ -135,7 +137,12 @@ class ScalperCLIDashboard:
         header_text = Text()
         header_text.append(" ⚡ AI QUANTITATIVE SCALPER (M5) ", style="bold white on blue")
         header_text.append("  |  ", style="dim")
-        header_text.append(f"Model: {self.engine.model} (effort: {self.engine.reasoning_effort})", style="bold cyan")
+
+        if self.last_decision and self.last_decision.get("emergency_mode"):
+            header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold orange1")
+        else:
+            header_text.append(f"Model: {self.engine.model}", style="bold cyan")
+
         header_text.append("  |  ", style="dim")
         header_text.append(f"Asset: {self.engine.symbol}", style="bold yellow")
         header_text.append("  |  ", style="dim")
@@ -183,7 +190,7 @@ class ScalperCLIDashboard:
         timer_color = "bold green" if wait_seconds > 30 else "bold red blink"
 
         if self.is_analyzing:
-            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nรอการวิเคราะห์ (~30s)"
+            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nรอการวิเคราะห์ (~15s)"
         else:
             timer_text = f"[{timer_color}]{wait_m:02d}:{wait_s:02d}[/] น.\nรอบถัดไป: {target_time.strftime('%H:%M:%S')}"
 
@@ -219,6 +226,7 @@ class ScalperCLIDashboard:
             new_tp = self.last_decision.get("new_tp")
             regime = self.last_decision.get("market_regime", "N/A")
             reasoning = self.last_decision.get("reasoning", "No rationale provided")
+            is_emergency = self.last_decision.get("emergency_mode", False)
 
             if action == "BUY":
                 action_color = "bold white on green"
@@ -251,11 +259,14 @@ class ScalperCLIDashboard:
             decision_text.append(order_details, style="bold yellow")
             decision_text.append("🧠 Deep Quantitative Rationale:\n", style="bold underline")
             decision_text.append(reasoning, style="italic text")
+
+            panel_title = "[bold red]🚨 EMERGENCY CONSENSUS: LUNA x2[/]" if is_emergency else "[bold]🧠 AI INTELLIGENCE[/]"
         else:
             decision_text = Text("\n\n   กำลังเตรียมข้อมูลเพื่อเริ่มการวิเคราะห์รอบแรก...", style="dim")
             ai_panel_border = "blue"
+            panel_title = "[bold]🧠 AI INTELLIGENCE[/]"
 
-        layout["ai_panel"].update(Panel(decision_text, title="[bold]🧠 GPT-6-SOL INTELLIGENCE[/]", box=box.ROUNDED, border_style=ai_panel_border))
+        layout["ai_panel"].update(Panel(decision_text, title=panel_title, box=box.ROUNDED, border_style=ai_panel_border))
 
         # 4. Main - Right: Recent M5 Candles & Trade History
         right_table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False)

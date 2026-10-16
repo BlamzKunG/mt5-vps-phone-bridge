@@ -2,10 +2,14 @@
 """
 M5 Price Action Scalping Engine (AI-Driven)
 -------------------------------------------
-- Model: gpt-6-sol (MaxPlus AI, reasoning_effort: xhigh)
+- Primary Model: gpt-6-sol (MaxPlus AI, reasoning_effort: xhigh)
+- Emergency Consensus Model: gpt-6-luna x 2 (Parallel Dual-Verification)
+  * เมื่อ gpt-6-sol ขัดข้อง (เช่น HTTP 503) จะเรียก gpt-6-luna 2 ตัวพร้อมกัน
+  * หากทั้งสองตัวเห็นไปทางเดียวกัน (Consensus) -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
+  * หากความเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD / HOLD_POSITION) เพื่อป้องกันความเสี่ยง
 - Data: 100-bar Normalized Context + 20-bar Detailed M5 OHLCV (NO Balance sent)
 - Strategy: Price Action Scalping 100 - 500 points on XAUUSD
-- Order Management: Supports Dynamic Trailing Stop, Breakeven, and Early Emergency Close
+- Order Management: Dynamic Trailing Stop, Breakeven, and Early Emergency Close
 - Timeout: Dynamic timeout up to ~270s (waiting until close to next cycle) with auto-retry
 - Sync: Automatically triggers on every M5 candle close (+1s buffer) using phone local time
 - Local Guard: Enforces 100-500 points SL/TP, spread check, and protective SL tightening only
@@ -18,6 +22,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
@@ -50,6 +55,7 @@ class PriceActionScalperEngine:
         bridge_api_key: Optional[str] = None,
         maxplus_api_key: Optional[str] = None,
         model: str = "gpt-6-sol",
+        fallback_model: str = "gpt-6-luna",
         reasoning_effort: str = "xhigh",
         symbol: str = "XAUUSD",
         lot_size: float = 0.01,
@@ -63,6 +69,7 @@ class PriceActionScalperEngine:
         self.bridge = RemoteMT5Bridge(vps_url=self.vps_url, api_key=bridge_key)
         self.maxplus_api_key = maxplus_api_key or os.getenv("MAXPLUS_API_KEY", "")
         self.model = model
+        self.fallback_model = fallback_model
         self.reasoning_effort = reasoning_effort
         self.symbol = symbol
         self.lot_size = lot_size
@@ -73,7 +80,7 @@ class PriceActionScalperEngine:
 
         self.last_processed_candle_time: Optional[str] = None
         logging.info("🚀 Price Action Scalper Engine Initialized")
-        logging.info(f"Target: {self.symbol} | Model: {self.model} (effort: {self.reasoning_effort}) | Lot: {self.lot_size}")
+        logging.info(f"Target: {self.symbol} | Primary: {self.model} | Emergency: {self.fallback_model} x2 (Consensus)")
         logging.info(f"Scalp Bounds: [{self.min_sl_tp_points}, {self.max_sl_tp_points}] points | Dry Run: {self.dry_run}")
 
     def prepare_market_context(self) -> Optional[Dict[str, Any]]:
@@ -162,11 +169,63 @@ class PriceActionScalperEngine:
             logging.error(f"❌ เกิดข้อผิดพลาดในการเตรียม Context ข้อมูล: {e}")
             return None
 
+    def _call_single_model(
+        self,
+        model_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        timeout_seconds: int,
+        reasoning_effort: Optional[str] = "xhigh",
+        tag: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """ยิงคำขอไปยังโมเดลที่กำหนดและแปลง JSON กลับมา"""
+        headers = {
+            "Authorization": f"Bearer {self.maxplus_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+
+        t0 = time.time()
+        try:
+            resp = requests.post(
+                "https://api.maxplus-ai.cc/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout_seconds
+            )
+            elapsed = time.time() - t0
+            if resp.status_code != 200:
+                logging.warning(f"⚠️ {tag or model_name} ส่งรหัส: HTTP {resp.status_code} - {resp.text[:150]}")
+                return None
+
+            data = resp.json()
+            raw_content = data["choices"][0]["message"]["content"].strip()
+            clean_json = raw_content.strip("```json").strip("```").strip()
+            decision = json.loads(clean_json)
+            decision["latency_seconds"] = round(elapsed, 2)
+            decision["usage"] = data.get("usage", {})
+            decision["raw_model"] = model_name
+            return decision
+        except Exception as e:
+            logging.warning(f"⚠️ {tag or model_name} call/parse failed: {e}")
+            return None
+
     def call_ai_decision(self, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        ส่งข้อมูลแท่งเทียนให้ gpt-6-sol ประมวลผลและส่งค่า Pure JSON กลับมา
-        - Dynamic Timeout: รอจนกว่าจะใกล้รอบแท่งถัดไป (สูงสุด 270s)
-        - Research-based System Prompt รองรับทั้ง Flat Mode และ Active Order Management Mode
+        ส่งข้อมูลแท่งเทียนให้ AI ประมวลผลและส่งค่า Pure JSON กลับมา
+        - Primary: gpt-6-sol (effort: xhigh)
+        - Emergency Protocol: หาก gpt-6-sol ขัดข้อง (เช่น 503) จะเรียก gpt-6-luna 2 ตัวพร้อมกันแบบขนาน
+          และเปรียบเทียบ Consensus:
+          * หากทั้งสองตัวเห็นไปทางเดียวกัน -> ให้ออกออเดอร์ โดยยึด TP/SL จากตัวแรก (Luna #1) ตามคำสั่งของผู้ใช้
+          * หากทั้งสองตัวเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD หรือ HOLD_POSITION) เพื่อป้องกันความเสี่ยง
         """
         now = datetime.now()
         minutes_to_add = 5 - (now.minute % 5)
@@ -237,54 +296,114 @@ Latest Closed Price: {ctx['current_price']:.2f}
 
 Analyze the market structure, evaluate trade health (if in position) or setup confluence (if flat), and output your pure JSON decision:"""
 
-        headers = {
-            "Authorization": f"Bearer {self.maxplus_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "reasoning_effort": self.reasoning_effort
-        }
+        # -------------------------------------------------------------
+        # STEP 1: ลองเรียก Primary Model (gpt-6-sol) ก่อน
+        # -------------------------------------------------------------
+        logging.info(f"⏳ [Primary Model] เรียก {self.model} (Dynamic Timeout: {timeout_seconds}s)...")
+        sol_decision = self._call_single_model(
+            model_name=self.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            timeout_seconds=min(timeout_seconds, 60), # ให้เวลา sol ลองภายใน 60s
+            reasoning_effort=self.reasoning_effort,
+            tag=f"Primary-{self.model}"
+        )
 
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                t0 = time.time()
-                logging.info(f"⏳ เรียก AI ด้วย Dynamic Timeout: {timeout_seconds}s (Attempt {attempt+1}/{max_retries})...")
-                resp = requests.post(
-                    "https://api.maxplus-ai.cc/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout_seconds
-                )
-                elapsed = time.time() - t0
+        if sol_decision:
+            sol_decision["model_used"] = self.model
+            sol_decision["emergency_mode"] = False
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Primary Model ({self.model})")
+            return sol_decision
 
-                if resp.status_code != 200:
-                    logging.error(f"❌ MaxPlus API Error: HTTP {resp.status_code} - {resp.text}")
-                    if attempt < max_retries - 1:
-                        time.sleep(3)
-                        continue
-                    return None
+        # -------------------------------------------------------------
+        # STEP 2: เข้าสู่ Emergency Consensus Protocol (gpt-6-luna x 2)
+        # -------------------------------------------------------------
+        logging.warning("=" * 65)
+        logging.warning(f"🚨 [EMERGENCY PROTOCOL ACTIVATED] {self.model} ขัดข้องหรือไม่พร้อมใช้งาน!")
+        logging.warning(f"👥 เรียกใช้งาน {self.fallback_model} แบบคู่ขนาน 2 ตัว (Instance #1 & #2) เพื่อทำ Consensus Verification...")
+        logging.warning("=" * 65)
 
-                data = resp.json()
-                raw_content = data["choices"][0]["message"]["content"].strip()
-                clean_json = raw_content.strip("```json").strip("```").strip()
-                decision = json.loads(clean_json)
-                decision["latency_seconds"] = round(elapsed, 2)
-                decision["usage"] = data.get("usage", {})
-                return decision
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as net_err:
-                logging.warning(f"⚠️ Network issue on attempt {attempt+1}/{max_retries}: {net_err}")
-                if attempt < max_retries - 1:
-                    time.sleep(3)
-            except Exception as e:
-                logging.error(f"❌ การเรียก AI หรือ Parse JSON ล้มเหลว: {e}")
-                return None
-        return None
+        now2 = datetime.now()
+        seconds_left = max(30, int((target_time - now2).total_seconds()) - 10)
+
+        def _worker(instance_id: int):
+            return instance_id, self._call_single_model(
+                model_name=self.fallback_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout_seconds=seconds_left,
+                reasoning_effort="xhigh",
+                tag=f"Luna-#{instance_id}"
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(_worker, 1), executor.submit(_worker, 2)]
+            results = {}
+            for fut in as_completed(futures):
+                try:
+                    i_id, dec = fut.result()
+                    results[i_id] = dec
+                except Exception as e:
+                    logging.error(f"❌ Luna worker error: {e}")
+
+        dec1 = results.get(1)
+        dec2 = results.get(2)
+
+        if not dec1 or not dec2:
+            logging.error(f"❌ [EMERGENCY FAILED] gpt-6-luna ตอบกลับไม่ครบทั้งสองตัว (Luna-1: {'OK' if dec1 else 'FAIL'}, Luna-2: {'OK' if dec2 else 'FAIL'})")
+            is_in_trade = bool(ctx.get("active_trade"))
+            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
+            return {
+                "action": safe_action,
+                "confidence": 0.0,
+                "sl_points": None,
+                "tp_points": None,
+                "new_sl": None,
+                "new_tp": None,
+                "market_regime": "Emergency Instances Incomplete",
+                "reasoning": "Primary model failed and emergency Luna instances did not complete both responses. Safeguard maintains safe hold stance.",
+                "model_used": "Emergency Failed -> Safe Hold",
+                "emergency_mode": True
+            }
+
+        act1 = dec1.get("action", "").upper()
+        act2 = dec2.get("action", "").upper()
+        conf1 = dec1.get("confidence", 0.0)
+        conf2 = dec2.get("confidence", 0.0)
+
+        logging.info(f"🔍 [Consensus Evaluation] Luna #1: {act1} (Conf: {conf1:.2f}) vs Luna #2: {act2} (Conf: {conf2:.2f})")
+
+        # ตรวจสอบว่าเห็นไปในทางเดียวกันหรือไม่ (Consensus Check)
+        if act1 == act2:
+            logging.info(f"🤝 [CONSENSUS AGREED] AI ทั้ง 2 ตัวเห็นตรงกันเป็นเอกฉันท์: {act1}")
+            logging.info(f"🎯 ยึดค่า TP/SL และเกณฑ์คำสั่งจากตัวแรก (Luna #1) ตามมาตรการที่กำหนด")
+            final_decision = dec1.copy()
+            final_decision["model_used"] = f"{self.fallback_model} x2 (Consensus: {act1})"
+            final_decision["emergency_mode"] = True
+            final_decision["consensus_agreed"] = True
+            final_decision["luna1_action"] = act1
+            final_decision["luna2_action"] = act2
+            final_decision["luna1_conf"] = conf1
+            final_decision["luna2_conf"] = conf2
+            final_decision["reasoning"] = f"[Luna-1 (Leader)]: {dec1.get('reasoning')} | [Luna-2 (Consensus Verified)]: {dec2.get('reasoning')}"
+            return final_decision
+        else:
+            logging.warning(f"⚠️ [CONSENSUS DIVERGENCE] ความเห็นไม่ตรงกัน ({act1} != {act2}) -> สั่งระงับการเทรดเพื่อความปลอดภัย")
+            is_in_trade = bool(ctx.get("active_trade"))
+            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
+            return {
+                "action": safe_action,
+                "confidence": 0.0,
+                "sl_points": None,
+                "tp_points": None,
+                "new_sl": None,
+                "new_tp": None,
+                "market_regime": f"Consensus Split: Luna1={act1} vs Luna2={act2}",
+                "reasoning": f"Emergency consensus divergence: Luna #1 decided {act1} ({dec1.get('reasoning')[:120]}...), whereas Luna #2 decided {act2} ({dec2.get('reasoning')[:120]}...). As both instances did not reach unanimous agreement, the system holds position / flat.",
+                "model_used": f"{self.fallback_model} x2 (Split: {act1}/{act2} -> Safe Hold)",
+                "emergency_mode": True,
+                "consensus_agreed": False
+            }
 
     def execute_decision(self, decision: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> bool:
         """
@@ -293,9 +412,10 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
         action = decision.get("action", "HOLD").upper()
         confidence = decision.get("confidence", 0.0)
         reasoning = decision.get("reasoning", "")
+        model_used = decision.get("model_used", self.model)
         active_trade = ctx.get("active_trade") if ctx else None
 
-        logging.info(f"📊 AI Decision: {action} (Conf: {confidence:.2f}) | Regime: {decision.get('market_regime')}")
+        logging.info(f"📊 AI Decision: {action} (Conf: {confidence:.2f}) | Model: {model_used} | Regime: {decision.get('market_regime')}")
         logging.info(f"💡 Rationale: {reasoning}")
 
         # 1. HOLD หรือ HOLD_POSITION
