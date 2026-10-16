@@ -6,8 +6,10 @@ Realtime Terminal Dashboard for Termux / Linux
 - Live second-by-second countdown to next M5 candle close
 - Live Bid/Ask/Spread tracker from VPS MT5
 - AI Decision display (Action, Confidence, Regime, Reasoning)
-- 100-Bar Normalized level bar & recent 5 candles table
-- Active Position & Trade History tracker
+- Supports Active Trade Management (HOLD_POSITION, MODIFY_SLTP, CLOSE_POSITION)
+- 100-Bar Normalized level bar & recent candles
+- Active Position with SL/TP & Floating PnL
+- Recent Trade Journal
 """
 
 import os
@@ -27,7 +29,7 @@ from rich.live import Live
 from rich import box
 from rich.align import Align
 
-# Import our robust scalper engine & bridge
+# Import our robust scalper engine
 from phone_scalper_engine import PriceActionScalperEngine
 
 # Redirect root logging so it doesn't corrupt the Rich TUI screen
@@ -78,8 +80,20 @@ class ScalperCLIDashboard:
                 action = decision.get("action", "HOLD").upper()
                 self.status_message = f"✅ AI ตัดสินใจ: {action} (ความมั่นใจ {decision.get('confidence', 0):.0%})"
                 
-                # ทำการส่งคำสั่งผ่าน Safety Guard
-                executed = self.engine.execute_decision(decision)
+                # ทำการส่งคำสั่งผ่าน Safety Guard พร้อมส่ง context เพื่อจัดการ Active Trade
+                executed = self.engine.execute_decision(decision, ctx)
+
+                # จัดรูปแบบ SL/TP สำหรับ Journal
+                if action in ["BUY", "SELL"]:
+                    sl_tp_desc = f"{decision.get('sl_points', 0)}/{decision.get('tp_points', 0)}"
+                elif action == "MODIFY_SLTP":
+                    sl_tp_desc = f"SL->{decision.get('new_sl')}"
+                elif action in ["CLOSE_POSITION", "CLOSE_ALL"]:
+                    sl_tp_desc = "EXIT"
+                elif action == "HOLD_POSITION":
+                    sl_tp_desc = "IN_TRADE"
+                else:
+                    sl_tp_desc = "-"
                 
                 # บันทึกประวัติ
                 self.trade_history.insert(0, {
@@ -87,8 +101,7 @@ class ScalperCLIDashboard:
                     "action": action,
                     "confidence": decision.get("confidence", 0),
                     "price": ctx.get("current_price", 0),
-                    "sl": decision.get("sl_points", 0),
-                    "tp": decision.get("tp_points", 0),
+                    "sl_tp": sl_tp_desc,
                     "status": "EXECUTED" if executed else "SKIPPED/HOLD"
                 })
                 if len(self.trade_history) > 6:
@@ -170,7 +183,7 @@ class ScalperCLIDashboard:
         timer_color = "bold green" if wait_seconds > 30 else "bold red blink"
 
         if self.is_analyzing:
-            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nกรุณารอสักครู่ (~30s)"
+            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nรอการวิเคราะห์ (~30s)"
         else:
             timer_text = f"[{timer_color}]{wait_m:02d}:{wait_s:02d}[/] น.\nรอบถัดไป: {target_time.strftime('%H:%M:%S')}"
 
@@ -182,8 +195,10 @@ class ScalperCLIDashboard:
             p_lot = self.active_position.get("lot", 0.01)
             p_entry = self.active_position.get("entry_price", 0.0)
             p_pnl = self.active_position.get("pnl", 0.0)
+            p_sl = self.active_position.get("sl", 0.0)
             pnl_color = "bold green" if p_pnl >= 0 else "bold red"
-            pos_text = f"[bold]{p_dir} {p_lot} lot[/] @ {p_entry:.2f}\nFloating PnL: [{pnl_color}]{p_pnl:+.2f} USD[/]"
+            sl_info = f" | SL: {p_sl:.2f}" if p_sl else ""
+            pos_text = f"[bold]{p_dir} {p_lot} lot[/] @ {p_entry:.2f}{sl_info}\nFloating PnL: [{pnl_color}]{p_pnl:+.2f} USD[/]"
             pos_border = "green" if p_pnl >= 0 else "red"
         else:
             pos_text = "[dim]ไม่มีออเดอร์เปิดค้าง[/]\n(Scalp 100-500 pts)"
@@ -200,18 +215,42 @@ class ScalperCLIDashboard:
             conf = self.last_decision.get("confidence", 0.0)
             sl_pts = self.last_decision.get("sl_points", 0)
             tp_pts = self.last_decision.get("tp_points", 0)
+            new_sl = self.last_decision.get("new_sl")
+            new_tp = self.last_decision.get("new_tp")
             regime = self.last_decision.get("market_regime", "N/A")
             reasoning = self.last_decision.get("reasoning", "No rationale provided")
 
-            action_color = "bold white on green" if action == "BUY" else ("bold white on red" if action == "SELL" else "bold black on yellow")
+            if action == "BUY":
+                action_color = "bold white on green"
+                ai_panel_border = "green"
+                order_details = f"  SL: {sl_pts} pts ({sl_pts*0.01:.2f} USD)  |  TP: {tp_pts} pts ({tp_pts*0.01:.2f} USD)\n\n"
+            elif action == "SELL":
+                action_color = "bold white on red"
+                ai_panel_border = "red"
+                order_details = f"  SL: {sl_pts} pts ({sl_pts*0.01:.2f} USD)  |  TP: {tp_pts} pts ({tp_pts*0.01:.2f} USD)\n\n"
+            elif action == "HOLD_POSITION":
+                action_color = "bold white on blue"
+                ai_panel_border = "cyan"
+                order_details = "  Trade Thesis Intact: Holding Active Position\n\n"
+            elif action == "MODIFY_SLTP":
+                action_color = "bold white on magenta"
+                ai_panel_border = "magenta"
+                order_details = f"  Risk Guard: Tightening SL -> {new_sl} (TP: {new_tp or 'Unchanged'})\n\n"
+            elif action in ["CLOSE_POSITION", "CLOSE_ALL"]:
+                action_color = "bold white on dark_red"
+                ai_panel_border = "red"
+                order_details = "  Emergency / Structural Invalidation Exit at Market\n\n"
+            else:
+                action_color = "bold black on yellow"
+                ai_panel_border = "yellow"
+                order_details = "  No Setup: Maintaining Flat Stance\n\n"
+
             decision_text = Text()
             decision_text.append(f" ACTION: {action} ", style=action_color)
             decision_text.append(f"  Confidence: {conf:.0%}  |  Regime: {regime}\n", style="bold cyan")
-            decision_text.append(f"  SL: {sl_pts} pts ({sl_pts*0.01:.2f} USD)  |  TP: {tp_pts} pts ({tp_pts*0.01:.2f} USD)\n\n", style="bold yellow")
+            decision_text.append(order_details, style="bold yellow")
             decision_text.append("🧠 Deep Quantitative Rationale:\n", style="bold underline")
             decision_text.append(reasoning, style="italic text")
-
-            ai_panel_border = "green" if action == "BUY" else ("red" if action == "SELL" else "yellow")
         else:
             decision_text = Text("\n\n   กำลังเตรียมข้อมูลเพื่อเริ่มการวิเคราะห์รอบแรก...", style="dim")
             ai_panel_border = "blue"
@@ -228,12 +267,24 @@ class ScalperCLIDashboard:
 
         for h in self.trade_history:
             act = h["action"]
-            act_style = "green" if act == "BUY" else ("red" if act == "SELL" else "yellow")
+            if act == "BUY":
+                act_style = "green"
+            elif act == "SELL":
+                act_style = "red"
+            elif act == "HOLD_POSITION":
+                act_style = "cyan"
+            elif act == "MODIFY_SLTP":
+                act_style = "magenta"
+            elif act in ["CLOSE_POSITION", "CLOSE_ALL"]:
+                act_style = "bold red"
+            else:
+                act_style = "yellow"
+
             right_table.add_row(
                 h["time"],
                 f"[{act_style}]{act}[/]",
                 f"{h['price']:.2f}",
-                f"{h['sl']}/{h['tp']}",
+                f"{h.get('sl_tp', '-')}",
                 f"[dim]{h['status']}[/]"
             )
 
