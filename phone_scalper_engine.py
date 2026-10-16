@@ -2,11 +2,12 @@
 """
 M5 Price Action Scalping Engine (AI-Driven)
 -------------------------------------------
-- Primary Model: gpt-6-sol (MaxPlus AI, reasoning_effort: xhigh)
-- Emergency Consensus Model: gpt-6-luna x 2 (Parallel Dual-Verification)
-  * เมื่อ gpt-6-sol ขัดข้อง (เช่น HTTP 503) จะเรียก gpt-6-luna 2 ตัวพร้อมกัน
-  * หากทั้งสองตัวเห็นไปทางเดียวกัน (Consensus) -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
-  * หากความเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD / HOLD_POSITION) เพื่อป้องกันความเสี่ยง
+- 3-Tier Multi-Model Failover Architecture:
+  * Tier 1 (Primary): gpt-6.1-sol (MaxPlus AI, reasoning_effort: xhigh)
+  * Tier 2 (Secondary Fallback): gpt-6-sol (หาก 6.1 sol ขัดข้อง สลับมาตัวนี้)
+  * Tier 3 (Emergency Consensus): gpt-6-luna x 2 (หากทั้งสองตัวบนขัดข้อง เรียก Luna 2 ตัวพร้อมกัน)
+    - หาก Luna ทั้งสองตัวเห็นไปทางเดียวกัน (Consensus) -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
+    - หากความเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD / HOLD_POSITION) เพื่อป้องกันความเสี่ยง
 - Data: 100-bar Normalized Context + 20-bar Detailed M5 OHLCV (NO Balance sent)
 - Strategy: Price Action Scalping 100 - 500 points on XAUUSD
 - Order Management: Dynamic Trailing Stop, Breakeven, and Early Emergency Close
@@ -54,8 +55,9 @@ class PriceActionScalperEngine:
         vps_url: Optional[str] = None,
         bridge_api_key: Optional[str] = None,
         maxplus_api_key: Optional[str] = None,
-        model: str = "gpt-6-sol",
-        fallback_model: str = "gpt-6-luna",
+        model: str = "gpt-6.1-sol",
+        secondary_model: str = "gpt-6-sol",
+        emergency_model: str = "gpt-6-luna",
         reasoning_effort: str = "xhigh",
         symbol: str = "XAUUSD",
         lot_size: float = 0.01,
@@ -69,7 +71,8 @@ class PriceActionScalperEngine:
         self.bridge = RemoteMT5Bridge(vps_url=self.vps_url, api_key=bridge_key)
         self.maxplus_api_key = maxplus_api_key or os.getenv("MAXPLUS_API_KEY", "")
         self.model = model
-        self.fallback_model = fallback_model
+        self.secondary_model = secondary_model
+        self.emergency_model = emergency_model
         self.reasoning_effort = reasoning_effort
         self.symbol = symbol
         self.lot_size = lot_size
@@ -80,7 +83,7 @@ class PriceActionScalperEngine:
 
         self.last_processed_candle_time: Optional[str] = None
         logging.info("🚀 Price Action Scalper Engine Initialized")
-        logging.info(f"Target: {self.symbol} | Primary: {self.model} | Emergency: {self.fallback_model} x2 (Consensus)")
+        logging.info(f"Target: {self.symbol} | Tier 1: {self.model} | Tier 2: {self.secondary_model} | Tier 3: {self.emergency_model} x2")
         logging.info(f"Scalp Bounds: [{self.min_sl_tp_points}, {self.max_sl_tp_points}] points | Dry Run: {self.dry_run}")
 
     def prepare_market_context(self) -> Optional[Dict[str, Any]]:
@@ -220,12 +223,12 @@ class PriceActionScalperEngine:
 
     def call_ai_decision(self, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        ส่งข้อมูลแท่งเทียนให้ AI ประมวลผลและส่งค่า Pure JSON กลับมา
-        - Primary: gpt-6-sol (effort: xhigh)
-        - Emergency Protocol: หาก gpt-6-sol ขัดข้อง (เช่น 503) จะเรียก gpt-6-luna 2 ตัวพร้อมกันแบบขนาน
-          และเปรียบเทียบ Consensus:
-          * หากทั้งสองตัวเห็นไปทางเดียวกัน -> ให้ออกออเดอร์ โดยยึด TP/SL จากตัวแรก (Luna #1) ตามคำสั่งของผู้ใช้
-          * หากทั้งสองตัวเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD หรือ HOLD_POSITION) เพื่อป้องกันความเสี่ยง
+        ส่งข้อมูลแท่งเทียนให้ AI ประมวลผลด้วยสถาปัตยกรรม 3-Tier Failover:
+        - Tier 1 (Primary): gpt-6.1-sol (effort: xhigh)
+        - Tier 2 (Secondary Fallback): gpt-6-sol (หาก 6.1 sol ขัดข้อง สลับมาตัวนี้)
+        - Tier 3 (Emergency Consensus): gpt-6-luna x 2 (หากทั้งสองตัวบนขัดข้อง)
+          * หาก Luna ทั้งสองตัวเห็นไปทางเดียวกัน -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
+          * หากเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD หรือ HOLD_POSITION) เพื่อป้องกันความเสี่ยง
         """
         now = datetime.now()
         minutes_to_add = 5 - (now.minute % 5)
@@ -297,41 +300,69 @@ Latest Closed Price: {ctx['current_price']:.2f}
 Analyze the market structure, evaluate trade health (if in position) or setup confluence (if flat), and output your pure JSON decision:"""
 
         # -------------------------------------------------------------
-        # STEP 1: ลองเรียก Primary Model (gpt-6-sol) ก่อน
+        # STEP 1: ลองเรียก Tier-1 Primary Model (gpt-6.1-sol) ก่อน
         # -------------------------------------------------------------
-        logging.info(f"⏳ [Primary Model] เรียก {self.model} (Dynamic Timeout: {timeout_seconds}s)...")
-        sol_decision = self._call_single_model(
+        logging.info(f"⏳ [Tier 1: Primary] เรียก {self.model} (Dynamic Timeout: {timeout_seconds}s)...")
+        sol61_decision = self._call_single_model(
             model_name=self.model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            timeout_seconds=min(timeout_seconds, 60), # ให้เวลา sol ลองภายใน 60s
+            timeout_seconds=max(60, min(timeout_seconds, 90)),
             reasoning_effort=self.reasoning_effort,
             tag=f"Primary-{self.model}"
         )
 
-        if sol_decision:
-            sol_decision["model_used"] = self.model
-            sol_decision["emergency_mode"] = False
-            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Primary Model ({self.model})")
-            return sol_decision
+        if sol61_decision:
+            sol61_decision["model_used"] = self.model
+            sol61_decision["tier"] = 1
+            sol61_decision["emergency_mode"] = False
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-1 Primary Model ({self.model})")
+            return sol61_decision
 
         # -------------------------------------------------------------
-        # STEP 2: เข้าสู่ Emergency Consensus Protocol (gpt-6-luna x 2)
+        # STEP 2: หาก 6.1 sol ขัดข้อง สลับไปเรียก Tier-2 Secondary Model (gpt-6-sol)
         # -------------------------------------------------------------
         logging.warning("=" * 65)
-        logging.warning(f"🚨 [EMERGENCY PROTOCOL ACTIVATED] {self.model} ขัดข้องหรือไม่พร้อมใช้งาน!")
-        logging.warning(f"👥 เรียกใช้งาน {self.fallback_model} แบบคู่ขนาน 2 ตัว (Instance #1 & #2) เพื่อทำ Consensus Verification...")
+        logging.warning(f"⚠️ [TIER 1 FAILED] {self.model} ขัดข้องหรือไม่ตอบสนอง!")
+        logging.warning(f"🔄 [Tier 2: Fallback] สลับไปเรียก {self.secondary_model}...")
         logging.warning("=" * 65)
 
-        now2 = datetime.now()
-        seconds_left = max(30, int((target_time - now2).total_seconds()) - 10)
+        now_t2 = datetime.now()
+        seconds_left_t2 = max(45, int((target_time - now_t2).total_seconds()) - 10)
+
+        sol6_decision = self._call_single_model(
+            model_name=self.secondary_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            timeout_seconds=max(45, min(seconds_left_t2, 75)),
+            reasoning_effort=self.reasoning_effort,
+            tag=f"Secondary-{self.secondary_model}"
+        )
+
+        if sol6_decision:
+            sol6_decision["model_used"] = f"{self.secondary_model} (Tier 2 Fallback)"
+            sol6_decision["tier"] = 2
+            sol6_decision["emergency_mode"] = False
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-2 Secondary Model ({self.secondary_model})")
+            return sol6_decision
+
+        # -------------------------------------------------------------
+        # STEP 3: หากทั้ง 6.1 sol และ 6 sol ขัดข้อง เข้าสู่ Tier-3 Emergency Consensus (gpt-6-luna x 2)
+        # -------------------------------------------------------------
+        logging.warning("=" * 65)
+        logging.warning(f"🚨 [EMERGENCY PROTOCOL ACTIVATED] ทั้ง {self.model} และ {self.secondary_model} ใช้งานไม่ได้!")
+        logging.warning(f"👥 [Tier 3: Emergency] เรียกใช้งาน {self.emergency_model} แบบคู่ขนาน 2 ตัวเพื่อทำ Consensus Verification...")
+        logging.warning("=" * 65)
+
+        now3 = datetime.now()
+        seconds_left_t3 = max(30, int((target_time - now3).total_seconds()) - 10)
 
         def _worker(instance_id: int):
             return instance_id, self._call_single_model(
-                model_name=self.fallback_model,
+                model_name=self.emergency_model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                timeout_seconds=seconds_left,
+                timeout_seconds=seconds_left_t3,
                 reasoning_effort="xhigh",
                 tag=f"Luna-#{instance_id}"
             )
@@ -361,8 +392,9 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
                 "new_sl": None,
                 "new_tp": None,
                 "market_regime": "Emergency Instances Incomplete",
-                "reasoning": "Primary model failed and emergency Luna instances did not complete both responses. Safeguard maintains safe hold stance.",
+                "reasoning": "All upstream tiers failed and emergency Luna instances did not complete both responses. Safeguard maintains safe hold stance.",
                 "model_used": "Emergency Failed -> Safe Hold",
+                "tier": 3,
                 "emergency_mode": True
             }
 
@@ -378,7 +410,8 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
             logging.info(f"🤝 [CONSENSUS AGREED] AI ทั้ง 2 ตัวเห็นตรงกันเป็นเอกฉันท์: {act1}")
             logging.info(f"🎯 ยึดค่า TP/SL และเกณฑ์คำสั่งจากตัวแรก (Luna #1) ตามมาตรการที่กำหนด")
             final_decision = dec1.copy()
-            final_decision["model_used"] = f"{self.fallback_model} x2 (Consensus: {act1})"
+            final_decision["model_used"] = f"{self.emergency_model} x2 (Tier 3 Consensus: {act1})"
+            final_decision["tier"] = 3
             final_decision["emergency_mode"] = True
             final_decision["consensus_agreed"] = True
             final_decision["luna1_action"] = act1
@@ -400,7 +433,8 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
                 "new_tp": None,
                 "market_regime": f"Consensus Split: Luna1={act1} vs Luna2={act2}",
                 "reasoning": f"Emergency consensus divergence: Luna #1 decided {act1} ({dec1.get('reasoning')[:120]}...), whereas Luna #2 decided {act2} ({dec2.get('reasoning')[:120]}...). As both instances did not reach unanimous agreement, the system holds position / flat.",
-                "model_used": f"{self.fallback_model} x2 (Split: {act1}/{act2} -> Safe Hold)",
+                "model_used": f"{self.emergency_model} x2 (Tier 3 Split: {act1}/{act2} -> Safe Hold)",
+                "tier": 3,
                 "emergency_mode": True,
                 "consensus_agreed": False
             }

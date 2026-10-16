@@ -7,7 +7,10 @@ Realtime Terminal Dashboard for Termux / Linux
 - Live Bid/Ask/Spread tracker from VPS MT5
 - AI Decision display (Action, Confidence, Regime, Reasoning)
 - Supports Active Trade Management (HOLD_POSITION, MODIFY_SLTP, CLOSE_POSITION)
-- Emergency Consensus Display: gpt-6-luna x2 Dual Verification
+- 3-Tier Model Display:
+  * Tier 1 (Primary): gpt-6.1-sol
+  * Tier 2 (Fallback): gpt-6-sol
+  * Tier 3 (Emergency): gpt-6-luna x2 Dual Consensus
 - 100-Bar Normalized level bar & recent candles
 - Active Position with SL/TP & Floating PnL
 - Recent Trade Journal
@@ -66,7 +69,7 @@ class ScalperCLIDashboard:
     def trigger_ai_cycle(self):
         """เรียก AI วิเคราะห์แท่งเทียนรอบใหม่"""
         self.is_analyzing = True
-        self.status_message = f"🤖 กำลังวิเคราะห์แท่งเทียน (Primary: {self.engine.model} / Emergency: {self.engine.fallback_model} x2)..."
+        self.status_message = f"🤖 กำลังวิเคราะห์แท่งเทียน (T1: {self.engine.model} / T2: {self.engine.secondary_model} / T3: {self.engine.emergency_model} x2)..."
         try:
             ctx = self.engine.prepare_market_context()
             if not ctx:
@@ -140,8 +143,11 @@ class ScalperCLIDashboard:
 
         if self.last_decision and self.last_decision.get("emergency_mode"):
             header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold orange1")
+        elif self.last_decision and self.last_decision.get("tier") == 2:
+            header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold yellow")
         else:
-            header_text.append(f"Model: {self.engine.model}", style="bold cyan")
+            model_name = self.last_decision.get("model_used", self.engine.model) if self.last_decision else self.engine.model
+            header_text.append(f"Model: {model_name}", style="bold cyan")
 
         header_text.append("  |  ", style="dim")
         header_text.append(f"Asset: {self.engine.symbol}", style="bold yellow")
@@ -227,6 +233,7 @@ class ScalperCLIDashboard:
             regime = self.last_decision.get("market_regime", "N/A")
             reasoning = self.last_decision.get("reasoning", "No rationale provided")
             is_emergency = self.last_decision.get("emergency_mode", False)
+            tier = self.last_decision.get("tier", 1)
 
             if action == "BUY":
                 action_color = "bold white on green"
@@ -260,7 +267,12 @@ class ScalperCLIDashboard:
             decision_text.append("🧠 Deep Quantitative Rationale:\n", style="bold underline")
             decision_text.append(reasoning, style="italic text")
 
-            panel_title = "[bold red]🚨 EMERGENCY CONSENSUS: LUNA x2[/]" if is_emergency else "[bold]🧠 AI INTELLIGENCE[/]"
+            if is_emergency:
+                panel_title = "[bold red]🚨 TIER 3 EMERGENCY CONSENSUS: LUNA x2[/]"
+            elif tier == 2:
+                panel_title = "[bold yellow]🔄 TIER 2 FALLBACK: GPT-6-SOL[/]"
+            else:
+                panel_title = "[bold]🧠 TIER 1 PRIMARY: GPT-6.1-SOL[/]"
         else:
             decision_text = Text("\n\n   กำลังเตรียมข้อมูลเพื่อเริ่มการวิเคราะห์รอบแรก...", style="dim")
             ai_panel_border = "blue"
