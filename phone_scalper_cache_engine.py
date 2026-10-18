@@ -53,7 +53,7 @@ class PriceActionScalperCacheEngine:
         maxplus_api_key: Optional[str] = None,
         model: str = "gpt-6-sol",
         secondary_model: str = "gpt-6.1-sol",
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: str = "max",
         symbol: str = "XAUUSD",
         lot_size: float = 0.01,
         max_spread_points: float = 40.0,

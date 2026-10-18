@@ -150,10 +150,10 @@ class ScalperCLIDashboard:
         header_text.append("  |  ", style="dim")
 
         if self.last_decision and self.last_decision.get("tier") == 2:
-            header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold yellow")
+            header_text.append(f"Model: {self.last_decision.get('model_used')} (effort: {self.engine.reasoning_effort})", style="bold yellow")
         else:
             model_name = self.last_decision.get("model_used", self.engine.model) if self.last_decision else self.engine.model
-            header_text.append(f"Model: {model_name}", style="bold cyan")
+            header_text.append(f"Model: {model_name} (effort: {self.engine.reasoning_effort})", style="bold cyan")
 
         header_text.append("  |  ", style="dim")
         header_text.append(f"Asset: {self.engine.symbol}", style="bold yellow")
