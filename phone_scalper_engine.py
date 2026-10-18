@@ -2,12 +2,13 @@
 """
 M5 Price Action Scalping Engine (AI-Driven)
 -------------------------------------------
-- 3-Tier Multi-Model Failover Architecture:
-  * Tier 1 (Primary): gpt-6.1-sol (MaxPlus AI, reasoning_effort: xhigh)
-  * Tier 2 (Secondary Fallback): gpt-6-sol (หาก 6.1 sol ขัดข้อง สลับมาตัวนี้)
-  * Tier 3 (Emergency Consensus): gpt-6-luna x 2 (หากทั้งสองตัวบนขัดข้อง เรียก Luna 2 ตัวพร้อมกัน)
-    - หาก Luna ทั้งสองตัวเห็นไปทางเดียวกัน (Consensus) -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
-    - หากความเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD / HOLD_POSITION) เพื่อป้องกันความเสี่ยง
+- Market Status Guard:
+  * ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่ (Weekend, Daily Rollover Break, Stale Tick)
+  * หากตลาดปิดทำการ จะข้ามการเรียก AI โดยสิ้นเชิงเพื่อประหยัด Token และป้องกัน Error
+- Model Architecture:
+  * Primary Model (Tier 1): gpt-6-sol (MaxPlus AI, reasoning_effort: xhigh)
+  * Secondary Model (Tier 2): gpt-6.1-sol (หาก 6 sol ขัดข้อง สลับมาตัวนี้)
+  * Failover Policy: หากทั้ง 6 sol และ 6.1 sol ใช้ไม่ได้ -> ข้าม (SKIP) รอบนี้ทันที
 - Data: 100-bar Normalized Context + 20-bar Detailed M5 OHLCV (NO Balance sent)
 - Strategy: Price Action Scalping 100 - 500 points on XAUUSD
 - Order Management: Dynamic Trailing Stop, Breakeven, and Early Emergency Close
@@ -23,7 +24,6 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
@@ -55,9 +55,8 @@ class PriceActionScalperEngine:
         vps_url: Optional[str] = None,
         bridge_api_key: Optional[str] = None,
         maxplus_api_key: Optional[str] = None,
-        model: str = "gpt-6.1-sol",
-        secondary_model: str = "gpt-6-sol",
-        emergency_model: str = "gpt-6-luna",
+        model: str = "gpt-6-sol",
+        secondary_model: str = "gpt-6.1-sol",
         reasoning_effort: str = "xhigh",
         symbol: str = "XAUUSD",
         lot_size: float = 0.01,
@@ -72,7 +71,6 @@ class PriceActionScalperEngine:
         self.maxplus_api_key = maxplus_api_key or os.getenv("MAXPLUS_API_KEY", "")
         self.model = model
         self.secondary_model = secondary_model
-        self.emergency_model = emergency_model
         self.reasoning_effort = reasoning_effort
         self.symbol = symbol
         self.lot_size = lot_size
@@ -83,8 +81,54 @@ class PriceActionScalperEngine:
 
         self.last_processed_candle_time: Optional[str] = None
         logging.info("🚀 Price Action Scalper Engine Initialized")
-        logging.info(f"Target: {self.symbol} | Tier 1: {self.model} | Tier 2: {self.secondary_model} | Tier 3: {self.emergency_model} x2")
+        logging.info(f"Target: {self.symbol} | Primary: {self.model} | Secondary: {self.secondary_model} | Failover: Skip")
         logging.info(f"Scalp Bounds: [{self.min_sl_tp_points}, {self.max_sl_tp_points}] points | Dry Run: {self.dry_run}")
+
+    def is_market_open(self) -> Tuple[bool, str]:
+        """
+        ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่
+        1. ตรวจสอบปฏิทินเวลาทำการ (Forex / Gold Market Hours):
+           - วันเสาร์: ปิดทำการทั้งวัน
+           - วันอาทิตย์: ปิดทำการจนถึง ~22:00 UTC
+           - คืนวันศุกร์: ปิดทำการหลัง 22:00 UTC
+           - ช่วงพักประจำวัน (Daily Rollover Break): วันจันทร์-ศุกร์ ~21:00 - 22:00 UTC สำหรับ XAUUSD
+        2. ตรวจสอบความสดของ Tick ล่าสุด (Tick Freshness):
+           - หาก Tick ล่าสุดจาก MT5 ห่างจากปัจจุบันเกิน 15 นาที (900 วินาที) แสดงว่าตลาดปิดหรือหยุดพักการซื้อขาย
+        """
+        now_utc = datetime.now(timezone.utc)
+        weekday = now_utc.weekday() # 0=Mon, ..., 4=Fri, 5=Sat, 6=Sun
+        hour = now_utc.hour
+
+        # 1. เช็ควันหยุดสุดสัปดาห์ (Weekend Check)
+        if weekday == 5:
+            return False, "วันเสาร์ (Weekend Closure)"
+        if weekday == 6 and hour < 22:
+            time_str = now_utc.strftime("%H:%M")
+            return False, f"วันอาทิตย์ก่อนเปิดตลาด (Sunday {time_str} UTC < 22:00 UTC)"
+        if weekday == 4 and hour >= 22:
+            return False, "คืนวันศุกร์ตลาดปิดทำการแล้ว (Friday Post-Market)"
+
+        # 2. เช็คช่วงพักประจำวันของตลาดทองคำ (~21:00-22:00 UTC)
+        if "XAU" in self.symbol.upper() or "GOLD" in self.symbol.upper():
+            if hour == 21:
+                return False, "ช่วงพักประจำวันของตลาดทองคำ (Daily Rollover Break ~21:00-22:00 UTC)"
+
+        # 3. เช็คความสดของ Tick จาก MT5
+        try:
+            price_info = self.bridge.get_current_price(symbol=self.symbol)
+            if not price_info:
+                return False, "ไม่สามารถเชื่อมต่อดึงราคา Realtime จาก MT5 ได้"
+
+            tick_time = price_info.get("time")
+            if tick_time:
+                diff_seconds = now_utc.timestamp() - tick_time
+                if diff_seconds > 900: # เกิน 15 นาที
+                    diff_hours = diff_seconds / 3600
+                    return False, f"Tick ล่าสุดหยุดนิ่งเกิน {diff_hours:.1f} ชม. (ตลาดปิดหรือหยุดพักการซื้อขาย)"
+        except Exception as e:
+            logging.warning(f"⚠️ ตรวจสอบ Tick Freshness ไม่สำเร็จ: {e}")
+
+        return True, "ตลาดเปิดทำการปกติ (Market Open)"
 
     def prepare_market_context(self) -> Optional[Dict[str, Any]]:
         """
@@ -223,12 +267,10 @@ class PriceActionScalperEngine:
 
     def call_ai_decision(self, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        ส่งข้อมูลแท่งเทียนให้ AI ประมวลผลด้วยสถาปัตยกรรม 3-Tier Failover:
-        - Tier 1 (Primary): gpt-6.1-sol (effort: xhigh)
-        - Tier 2 (Secondary Fallback): gpt-6-sol (หาก 6.1 sol ขัดข้อง สลับมาตัวนี้)
-        - Tier 3 (Emergency Consensus): gpt-6-luna x 2 (หากทั้งสองตัวบนขัดข้อง)
-          * หาก Luna ทั้งสองตัวเห็นไปทางเดียวกัน -> ออกออเดอร์ตามตัวแรก (ยึด TP/SL ของตัวแรก)
-          * หากเห็นไม่ตรงกัน -> สั่งปลอดภัย (HOLD หรือ HOLD_POSITION) เพื่อป้องกันความเสี่ยง
+        ส่งข้อมูลแท่งเทียนให้ AI ประมวลผล:
+        - Primary Model: gpt-6-sol (effort: xhigh)
+        - Secondary Fallback: gpt-6.1-sol (หาก 6 sol ขัดข้อง)
+        - Failover Policy: หากทั้ง 6 sol และ 6.1 sol ใช้ไม่ได้ -> ข้าม (SKIP) รอบนี้ทันที
         """
         now = datetime.now()
         minutes_to_add = 5 - (now.minute % 5)
@@ -300,10 +342,10 @@ Latest Closed Price: {ctx['current_price']:.2f}
 Analyze the market structure, evaluate trade health (if in position) or setup confluence (if flat), and output your pure JSON decision:"""
 
         # -------------------------------------------------------------
-        # STEP 1: ลองเรียก Tier-1 Primary Model (gpt-6.1-sol) ก่อน
+        # STEP 1: ลองเรียก Primary Model (gpt-6-sol) ก่อน
         # -------------------------------------------------------------
-        logging.info(f"⏳ [Tier 1: Primary] เรียก {self.model} (Dynamic Timeout: {timeout_seconds}s)...")
-        sol61_decision = self._call_single_model(
+        logging.info(f"⏳ [Primary Model] เรียก {self.model} (Dynamic Timeout: {timeout_seconds}s)...")
+        sol6_decision = self._call_single_model(
             model_name=self.model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -312,25 +354,24 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
             tag=f"Primary-{self.model}"
         )
 
-        if sol61_decision:
-            sol61_decision["model_used"] = self.model
-            sol61_decision["tier"] = 1
-            sol61_decision["emergency_mode"] = False
-            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-1 Primary Model ({self.model})")
-            return sol61_decision
+        if sol6_decision:
+            sol6_decision["model_used"] = self.model
+            sol6_decision["tier"] = 1
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Primary Model ({self.model})")
+            return sol6_decision
 
         # -------------------------------------------------------------
-        # STEP 2: หาก 6.1 sol ขัดข้อง สลับไปเรียก Tier-2 Secondary Model (gpt-6-sol)
+        # STEP 2: หาก 6 sol ขัดข้อง สลับไปเรียก Secondary Model (gpt-6.1-sol)
         # -------------------------------------------------------------
         logging.warning("=" * 65)
-        logging.warning(f"⚠️ [TIER 1 FAILED] {self.model} ขัดข้องหรือไม่ตอบสนอง!")
-        logging.warning(f"🔄 [Tier 2: Fallback] สลับไปเรียก {self.secondary_model}...")
+        logging.warning(f"⚠️ [PRIMARY FAILED] {self.model} ขัดข้องหรือไม่ตอบสนอง!")
+        logging.warning(f"🔄 [Secondary Fallback] สลับไปเรียก {self.secondary_model}...")
         logging.warning("=" * 65)
 
         now_t2 = datetime.now()
         seconds_left_t2 = max(45, int((target_time - now_t2).total_seconds()) - 10)
 
-        sol6_decision = self._call_single_model(
+        sol61_decision = self._call_single_model(
             model_name=self.secondary_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -339,105 +380,34 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
             tag=f"Secondary-{self.secondary_model}"
         )
 
-        if sol6_decision:
-            sol6_decision["model_used"] = f"{self.secondary_model} (Tier 2 Fallback)"
-            sol6_decision["tier"] = 2
-            sol6_decision["emergency_mode"] = False
-            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-2 Secondary Model ({self.secondary_model})")
-            return sol6_decision
+        if sol61_decision:
+            sol61_decision["model_used"] = f"{self.secondary_model} (Fallback)"
+            sol61_decision["tier"] = 2
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Secondary Model ({self.secondary_model})")
+            return sol61_decision
 
         # -------------------------------------------------------------
-        # STEP 3: หากทั้ง 6.1 sol และ 6 sol ขัดข้อง เข้าสู่ Tier-3 Emergency Consensus (gpt-6-luna x 2)
+        # STEP 3: หากทั้งสองตัวใช้ไม่ได้ -> SKIP ทันทีตามคำสั่งผู้ใช้
         # -------------------------------------------------------------
         logging.warning("=" * 65)
-        logging.warning(f"🚨 [EMERGENCY PROTOCOL ACTIVATED] ทั้ง {self.model} และ {self.secondary_model} ใช้งานไม่ได้!")
-        logging.warning(f"👥 [Tier 3: Emergency] เรียกใช้งาน {self.emergency_model} แบบคู่ขนาน 2 ตัวเพื่อทำ Consensus Verification...")
+        logging.warning(f"🚨 [ALL TIERS FAILED] ทั้ง {self.model} และ {self.secondary_model} ใช้งานไม่ได้!")
+        logging.warning("⏭️ มาตรการระบุ: หากทั้ง 6 sol และ 6.1 sol ใช้ไม่ได้ ให้ SKIP รอบนี้ทันที ไม่เปิดออเดอร์ใหม่")
         logging.warning("=" * 65)
 
-        now3 = datetime.now()
-        seconds_left_t3 = max(30, int((target_time - now3).total_seconds()) - 10)
-
-        def _worker(instance_id: int):
-            return instance_id, self._call_single_model(
-                model_name=self.emergency_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                timeout_seconds=seconds_left_t3,
-                reasoning_effort="xhigh",
-                tag=f"Luna-#{instance_id}"
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(_worker, 1), executor.submit(_worker, 2)]
-            results = {}
-            for fut in as_completed(futures):
-                try:
-                    i_id, dec = fut.result()
-                    results[i_id] = dec
-                except Exception as e:
-                    logging.error(f"❌ Luna worker error: {e}")
-
-        dec1 = results.get(1)
-        dec2 = results.get(2)
-
-        if not dec1 or not dec2:
-            logging.error(f"❌ [EMERGENCY FAILED] gpt-6-luna ตอบกลับไม่ครบทั้งสองตัว (Luna-1: {'OK' if dec1 else 'FAIL'}, Luna-2: {'OK' if dec2 else 'FAIL'})")
-            is_in_trade = bool(ctx.get("active_trade"))
-            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
-            return {
-                "action": safe_action,
-                "confidence": 0.0,
-                "sl_points": None,
-                "tp_points": None,
-                "new_sl": None,
-                "new_tp": None,
-                "market_regime": "Emergency Instances Incomplete",
-                "reasoning": "All upstream tiers failed and emergency Luna instances did not complete both responses. Safeguard maintains safe hold stance.",
-                "model_used": "Emergency Failed -> Safe Hold",
-                "tier": 3,
-                "emergency_mode": True
-            }
-
-        act1 = dec1.get("action", "").upper()
-        act2 = dec2.get("action", "").upper()
-        conf1 = dec1.get("confidence", 0.0)
-        conf2 = dec2.get("confidence", 0.0)
-
-        logging.info(f"🔍 [Consensus Evaluation] Luna #1: {act1} (Conf: {conf1:.2f}) vs Luna #2: {act2} (Conf: {conf2:.2f})")
-
-        # ตรวจสอบว่าเห็นไปในทางเดียวกันหรือไม่ (Consensus Check)
-        if act1 == act2:
-            logging.info(f"🤝 [CONSENSUS AGREED] AI ทั้ง 2 ตัวเห็นตรงกันเป็นเอกฉันท์: {act1}")
-            logging.info(f"🎯 ยึดค่า TP/SL และเกณฑ์คำสั่งจากตัวแรก (Luna #1) ตามมาตรการที่กำหนด")
-            final_decision = dec1.copy()
-            final_decision["model_used"] = f"{self.emergency_model} x2 (Tier 3 Consensus: {act1})"
-            final_decision["tier"] = 3
-            final_decision["emergency_mode"] = True
-            final_decision["consensus_agreed"] = True
-            final_decision["luna1_action"] = act1
-            final_decision["luna2_action"] = act2
-            final_decision["luna1_conf"] = conf1
-            final_decision["luna2_conf"] = conf2
-            final_decision["reasoning"] = f"[Luna-1 (Leader)]: {dec1.get('reasoning')} | [Luna-2 (Consensus Verified)]: {dec2.get('reasoning')}"
-            return final_decision
-        else:
-            logging.warning(f"⚠️ [CONSENSUS DIVERGENCE] ความเห็นไม่ตรงกัน ({act1} != {act2}) -> สั่งระงับการเทรดเพื่อความปลอดภัย")
-            is_in_trade = bool(ctx.get("active_trade"))
-            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
-            return {
-                "action": safe_action,
-                "confidence": 0.0,
-                "sl_points": None,
-                "tp_points": None,
-                "new_sl": None,
-                "new_tp": None,
-                "market_regime": f"Consensus Split: Luna1={act1} vs Luna2={act2}",
-                "reasoning": f"Emergency consensus divergence: Luna #1 decided {act1} ({dec1.get('reasoning')[:120]}...), whereas Luna #2 decided {act2} ({dec2.get('reasoning')[:120]}...). As both instances did not reach unanimous agreement, the system holds position / flat.",
-                "model_used": f"{self.emergency_model} x2 (Tier 3 Split: {act1}/{act2} -> Safe Hold)",
-                "tier": 3,
-                "emergency_mode": True,
-                "consensus_agreed": False
-            }
+        is_in_trade = bool(ctx.get("active_trade"))
+        safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
+        return {
+            "action": safe_action,
+            "confidence": 0.0,
+            "sl_points": None,
+            "tp_points": None,
+            "new_sl": None,
+            "new_tp": None,
+            "market_regime": "All Models Unavailable - Cycle Skipped",
+            "reasoning": f"Both primary ({self.model}) and secondary ({self.secondary_model}) models failed to respond. Protocol skipped this cycle to ensure account safety.",
+            "model_used": "All Models Failed -> Skipped",
+            "tier": 0
+        }
 
     def execute_decision(self, decision: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> bool:
         """
@@ -596,7 +566,15 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
         local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.info("=" * 60)
         logging.info(f"🔄 เริ่มรอบการทำงาน: {local_time_str} (เวลาเครื่อง)")
-        
+
+        # 1. ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่
+        is_open, market_reason = self.is_market_open()
+        if not is_open:
+            logging.info(f"⏸️ [MARKET CLOSED] ตลาด {self.symbol} ปิดทำการ ({market_reason})")
+            logging.info("💤 ข้ามการเรียก AI ในรอบนี้เพื่อประหยัดเครดิตและป้องกันข้อผิดพลาด")
+            return False
+
+        # 2. เตรียม Context ข้อมูลตลาด
         ctx = self.prepare_market_context()
         if not ctx:
             logging.warning("⚠️ ข้อมูลไม่พร้อม ข้ามรอบนี้")

@@ -3,14 +3,12 @@
 M5 Price Action Scalper - Rich CLI Dashboard
 --------------------------------------------
 Realtime Terminal Dashboard for Termux / Linux
+- Market Status Check: ตรวจสอบสถานะตลาดเปิด/ปิดอัตโนมัติ
 - Live second-by-second countdown to next M5 candle close
 - Live Bid/Ask/Spread tracker from VPS MT5
 - AI Decision display (Action, Confidence, Regime, Reasoning)
-- Supports Active Trade Management (HOLD_POSITION, MODIFY_SLTP, CLOSE_POSITION)
-- 3-Tier Model Display:
-  * Tier 1 (Primary): gpt-6.1-sol
-  * Tier 2 (Fallback): gpt-6-sol
-  * Tier 3 (Emergency): gpt-6-luna x2 Dual Consensus
+- Model Failover Display: Primary (gpt-6-sol) / Fallback (gpt-6.1-sol) / Failover (Skip)
+- Active Trade Management (HOLD_POSITION, MODIFY_SLTP, CLOSE_POSITION)
 - 100-Bar Normalized level bar & recent candles
 - Active Position with SL/TP & Floating PnL
 - Recent Trade Journal
@@ -50,13 +48,16 @@ class ScalperCLIDashboard:
         self.trade_history: List[Dict[str, Any]] = []
         self.active_position: Optional[Dict[str, Any]] = None
         self.live_price: Optional[Dict[str, Any]] = None
+        self.is_market_open: bool = True
+        self.market_status_desc: str = "กำลังตรวจสอบ..."
         self.is_analyzing: bool = False
         self.status_message: str = "พร้อมทำงาน - กำลังรอแท่งเทียนถัดไป..."
         self.last_processed_slot: Optional[str] = None
 
     def fetch_live_status(self):
-        """ดึงราคาและ Position ล่าสุดจาก MT5"""
+        """ดึงราคา, สถานะตลาด และ Position ล่าสุดจาก MT5"""
         try:
+            self.is_market_open, self.market_status_desc = self.engine.is_market_open()
             self.live_price = self.engine.bridge.get_current_price(symbol=self.engine.symbol)
             if hasattr(self.engine.bridge, "get_positions"):
                 positions = self.engine.bridge.get_positions(symbol=self.engine.symbol)
@@ -67,9 +68,18 @@ class ScalperCLIDashboard:
             self.status_message = f"เชื่อมต่อ VPS ขัดข้อง: {e}"
 
     def trigger_ai_cycle(self):
-        """เรียก AI วิเคราะห์แท่งเทียนรอบใหม่"""
+        """เรียก AI วิเคราะห์แท่งเทียนรอบใหม่ (เฉพาะเมื่อตลาดเปิดทำการ)"""
+        # 1. ตรวจสอบสถานะตลาดก่อนเรียก AI
+        is_open, market_reason = self.engine.is_market_open()
+        self.is_market_open = is_open
+        self.market_status_desc = market_reason
+
+        if not is_open:
+            self.status_message = f"⏸️ ตลาดปิดทำการ ({market_reason}) - ข้ามการเรียก AI เพื่อประหยัด Token"
+            return
+
         self.is_analyzing = True
-        self.status_message = f"🤖 กำลังวิเคราะห์แท่งเทียน (T1: {self.engine.model} / T2: {self.engine.secondary_model} / T3: {self.engine.emergency_model} x2)..."
+        self.status_message = f"🤖 กำลังวิเคราะห์แท่งเทียน (Primary: {self.engine.model} / Fallback: {self.engine.secondary_model})..."
         try:
             ctx = self.engine.prepare_market_context()
             if not ctx:
@@ -85,10 +95,9 @@ class ScalperCLIDashboard:
                 model_used = decision.get("model_used", self.engine.model)
                 self.status_message = f"✅ AI ตัดสินใจ: {action} ({model_used})"
                 
-                # ทำการส่งคำสั่งผ่าน Safety Guard พร้อมส่ง context เพื่อจัดการ Active Trade
+                # ส่งคำสั่งผ่าน Safety Guard
                 executed = self.engine.execute_decision(decision, ctx)
 
-                # จัดรูปแบบ SL/TP สำหรับ Journal
                 if action in ["BUY", "SELL"]:
                     sl_tp_desc = f"{decision.get('sl_points', 0)}/{decision.get('tp_points', 0)}"
                 elif action == "MODIFY_SLTP":
@@ -100,7 +109,6 @@ class ScalperCLIDashboard:
                 else:
                     sl_tp_desc = "-"
                 
-                # บันทึกประวัติ
                 self.trade_history.insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "action": action,
@@ -112,7 +120,7 @@ class ScalperCLIDashboard:
                 if len(self.trade_history) > 6:
                     self.trade_history.pop()
             else:
-                self.status_message = "❌ ไม่ได้รับคำตอบจาก AI"
+                self.status_message = "❌ ไม่ได้รับคำตอบจาก AI (รอบนี้ถูกข้าม)"
         except Exception as e:
             self.status_message = f"❌ Error ระหว่าง AI Cycle: {e}"
         finally:
@@ -141,9 +149,7 @@ class ScalperCLIDashboard:
         header_text.append(" ⚡ AI QUANTITATIVE SCALPER (M5) ", style="bold white on blue")
         header_text.append("  |  ", style="dim")
 
-        if self.last_decision and self.last_decision.get("emergency_mode"):
-            header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold orange1")
-        elif self.last_decision and self.last_decision.get("tier") == 2:
+        if self.last_decision and self.last_decision.get("tier") == 2:
             header_text.append(f"Model: {self.last_decision.get('model_used')}", style="bold yellow")
         else:
             model_name = self.last_decision.get("model_used", self.engine.model) if self.last_decision else self.engine.model
@@ -152,7 +158,12 @@ class ScalperCLIDashboard:
         header_text.append("  |  ", style="dim")
         header_text.append(f"Asset: {self.engine.symbol}", style="bold yellow")
         header_text.append("  |  ", style="dim")
-        header_text.append("● ONLINE", style="bold green")
+
+        if self.is_market_open:
+            header_text.append("● MARKET OPEN", style="bold green")
+        else:
+            header_text.append("● MARKET CLOSED", style="bold red blink")
+
         layout["header"].update(Panel(Align.center(header_text), box=box.ROUNDED, style="blue"))
 
         # 2. Top Metrics (Price, Spread, Countdown, Position)
@@ -195,8 +206,10 @@ class ScalperCLIDashboard:
         wait_s = wait_seconds % 60
         timer_color = "bold green" if wait_seconds > 30 else "bold red blink"
 
-        if self.is_analyzing:
-            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nรอการวิเคราะห์ (~15s)"
+        if not self.is_market_open:
+            timer_text = f"[bold red]ตลาดปิดทำการ[/]\n[dim]{self.market_status_desc[:25]}[/]"
+        elif self.is_analyzing:
+            timer_text = "[bold yellow blink]⚡ กำลังประมวลผล AI...[/]\nรอการวิเคราะห์ (~20s)"
         else:
             timer_text = f"[{timer_color}]{wait_m:02d}:{wait_s:02d}[/] น.\nรอบถัดไป: {target_time.strftime('%H:%M:%S')}"
 
@@ -223,7 +236,14 @@ class ScalperCLIDashboard:
         layout["top_metrics"].update(metrics_table)
 
         # 3. Main - Left: AI Decision Panel
-        if self.last_decision:
+        if not self.is_market_open:
+            decision_text = Text()
+            decision_text.append(f"\n   🛑 ตลาดปิดทำการ ({self.market_status_desc})\n\n", style="bold red")
+            decision_text.append("   ระบบทำการหยุดพักการวิเคราะห์ AI ชั่วคราวอัตโนมัติ เพื่อประหยัด Token เครดิต\n", style="yellow")
+            decision_text.append("   ระบบจะกลับมาทำงานต่อทันทีเมื่อตลาดเปิดทำการครับ", style="dim white")
+            ai_panel_border = "red"
+            panel_title = "[bold red]⏸️ MARKET CLOSED (AI PAUSED)[/]"
+        elif self.last_decision:
             action = self.last_decision.get("action", "HOLD").upper()
             conf = self.last_decision.get("confidence", 0.0)
             sl_pts = self.last_decision.get("sl_points", 0)
@@ -232,7 +252,6 @@ class ScalperCLIDashboard:
             new_tp = self.last_decision.get("new_tp")
             regime = self.last_decision.get("market_regime", "N/A")
             reasoning = self.last_decision.get("reasoning", "No rationale provided")
-            is_emergency = self.last_decision.get("emergency_mode", False)
             tier = self.last_decision.get("tier", 1)
 
             if action == "BUY":
@@ -267,12 +286,10 @@ class ScalperCLIDashboard:
             decision_text.append("🧠 Deep Quantitative Rationale:\n", style="bold underline")
             decision_text.append(reasoning, style="italic text")
 
-            if is_emergency:
-                panel_title = "[bold red]🚨 TIER 3 EMERGENCY CONSENSUS: LUNA x2[/]"
-            elif tier == 2:
-                panel_title = "[bold yellow]🔄 TIER 2 FALLBACK: GPT-6-SOL[/]"
+            if tier == 2:
+                panel_title = "[bold yellow]🔄 SECONDARY FALLBACK: GPT-6.1-SOL[/]"
             else:
-                panel_title = "[bold]🧠 TIER 1 PRIMARY: GPT-6.1-SOL[/]"
+                panel_title = "[bold]🧠 PRIMARY MODEL: GPT-6-SOL[/]"
         else:
             decision_text = Text("\n\n   กำลังเตรียมข้อมูลเพื่อเริ่มการวิเคราะห์รอบแรก...", style="dim")
             ai_panel_border = "blue"

@@ -2,19 +2,15 @@
 """
 M5 Price Action Scalping Engine - Max Cache Read Edition
 -------------------------------------------------------
-- Architecture: Prefix-Aligned KV Cache Optimization (Max Cache Read)
-  * โครงสร้าง Prompt ถูกจัดเรียงใหม่แบบ Prefix-First:
-    1. Static System Guidelines & Execution Rules (100% Immutable)
-    2. Historical Structure Context & 100-Bar Curve (Semi-Static Prefix)
-    3. Preceding Candles (Bars -20 to -2)
-    4. Realtime Trigger Suffix (Bar -1, Timestamp, Active Position) อยู่ล่างสุดเท่านั้น
-  * ช่วยให้ GPU ดึง KV Cache เดิมได้เกือบ 100% ลด Latency และประหยัดค่า API ถึง 95%
-- 3-Tier Multi-Model Failover Architecture:
-  * Tier 1 (Primary): gpt-6.1-sol (MaxPlus AI, reasoning_effort: xhigh)
-  * Tier 2 (Secondary Fallback): gpt-6-sol
-  * Tier 3 (Emergency Consensus): gpt-6-luna x 2 (Parallel Dual-Verification)
+- Market Status Guard:
+  * ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่ (Weekend, Daily Rollover Break, Stale Tick)
+  * หากตลาดปิดทำการ จะข้ามการเรียก AI โดยสิ้นเชิงเพื่อประหยัด Token และป้องกัน Error
+- Architecture: Prefix-Aligned KV Cache Read (ประหยัด Cache 95%)
+- Model Policy:
+  * Primary (Tier 1): gpt-6-sol
+  * Secondary (Tier 2): gpt-6.1-sol
+  * Failover: หากทั้งสองตัวไม่ทำงาน -> ข้าม (SKIP) รอบนี้ทันที
 - Target Asset: XAUUSD (M5) Scalp 100 - 500 points
-- Zero Balance Leakage, Protective Trailing Guard, Phone Local Clock Sync
 """
 
 import os
@@ -24,7 +20,6 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
@@ -56,9 +51,8 @@ class PriceActionScalperCacheEngine:
         vps_url: Optional[str] = None,
         bridge_api_key: Optional[str] = None,
         maxplus_api_key: Optional[str] = None,
-        model: str = "gpt-6.1-sol",
-        secondary_model: str = "gpt-6-sol",
-        emergency_model: str = "gpt-6-luna",
+        model: str = "gpt-6-sol",
+        secondary_model: str = "gpt-6.1-sol",
         reasoning_effort: str = "xhigh",
         symbol: str = "XAUUSD",
         lot_size: float = 0.01,
@@ -73,7 +67,6 @@ class PriceActionScalperCacheEngine:
         self.maxplus_api_key = maxplus_api_key or os.getenv("MAXPLUS_API_KEY", "")
         self.model = model
         self.secondary_model = secondary_model
-        self.emergency_model = emergency_model
         self.reasoning_effort = reasoning_effort
         self.symbol = symbol
         self.lot_size = lot_size
@@ -84,15 +77,52 @@ class PriceActionScalperCacheEngine:
 
         self.last_processed_candle_time: Optional[str] = None
         logging.info("⚡ [CACHE EDITION] Price Action Scalper Engine Initialized")
-        logging.info(f"Architecture: Prefix-Aligned KV Cache Read | Symbol: {self.symbol}")
-        logging.info(f"Tier 1: {self.model} | Tier 2: {self.secondary_model} | Tier 3: {self.emergency_model} x2")
+        logging.info(f"Target: {self.symbol} | Primary: {self.model} | Secondary: {self.secondary_model} | Failover: Skip")
+
+    def is_market_open(self) -> Tuple[bool, str]:
+        """
+        ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่
+        1. ตรวจสอบปฏิทินเวลาทำการ (Forex / Gold Market Hours):
+           - วันเสาร์: ปิดทำการทั้งวัน
+           - วันอาทิตย์: ปิดทำการจนถึง ~22:00 UTC
+           - คืนวันศุกร์: ปิดทำการหลัง 22:00 UTC
+           - ช่วงพักประจำวัน (Daily Rollover Break): วันจันทร์-ศุกร์ ~21:00 - 22:00 UTC
+        2. ตรวจสอบความสดของ Tick ล่าสุด (Tick Freshness):
+           - หาก Tick ล่าสุดจาก MT5 ห่างจากปัจจุบันเกิน 15 นาที (900 วินาที) แสดงว่าตลาดปิด
+        """
+        now_utc = datetime.now(timezone.utc)
+        weekday = now_utc.weekday()
+        hour = now_utc.hour
+
+        if weekday == 5:
+            return False, "วันเสาร์ (Weekend Closure)"
+        if weekday == 6 and hour < 22:
+            time_str = now_utc.strftime("%H:%M")
+            return False, f"วันอาทิตย์ก่อนเปิดตลาด (Sunday {time_str} UTC < 22:00 UTC)"
+        if weekday == 4 and hour >= 22:
+            return False, "คืนวันศุกร์ตลาดปิดทำการแล้ว (Friday Post-Market)"
+
+        if "XAU" in self.symbol.upper() or "GOLD" in self.symbol.upper():
+            if hour == 21:
+                return False, "ช่วงพักประจำวันของตลาดทองคำ (Daily Rollover Break ~21:00-22:00 UTC)"
+
+        try:
+            price_info = self.bridge.get_current_price(symbol=self.symbol)
+            if not price_info:
+                return False, "ไม่สามารถเชื่อมต่อดึงราคา Realtime จาก MT5 ได้"
+
+            tick_time = price_info.get("time")
+            if tick_time:
+                diff_seconds = now_utc.timestamp() - tick_time
+                if diff_seconds > 900:
+                    diff_hours = diff_seconds / 3600
+                    return False, f"Tick ล่าสุดหยุดนิ่งเกิน {diff_hours:.1f} ชม. (ตลาดปิดหรือหยุดพักการซื้อขาย)"
+        except Exception as e:
+            logging.warning(f"⚠️ ตรวจสอบ Tick Freshness ไม่สำเร็จ: {e}")
+
+        return True, "ตลาดเปิดทำการปกติ (Market Open)"
 
     def prepare_market_context(self) -> Optional[Dict[str, Any]]:
-        """
-        ดึง 105 แท่ง M5 ล่าสุด แยกข้อมูลออกเป็น 2 กลุ่ม:
-        1. Context Prefix (Semi-Static): 100 แท่ง Normalized + 19 แท่งประวัติศาสตร์ (-20 ถึง -2)
-        2. Dynamic Suffix (Realtime Trigger): แท่ง -1 ที่เพิ่งปิด + สถานะออเดอร์ปัจจุบัน
-        """
         try:
             df = self.bridge.get_historical_data(symbol=self.symbol, timeframe="5m", num_candles=105)
             if df.empty or len(df) < 100:
@@ -102,7 +132,6 @@ class PriceActionScalperCacheEngine:
             completed_df = df.iloc[-101:-1].copy() if len(df) > 100 else df.iloc[-100:].copy()
             last_candle_time = str(completed_df.iloc[-1]["timestamp"])
 
-            # 1. รายละเอียด 20 แท่งล่าสุด แยกเป็น Preceding (19 แท่ง) และ Trigger (1 แท่งล่าสุด)
             detailed_20 = completed_df.iloc[-20:].copy()
             preceding_19 = []
             for _, row in detailed_20.iloc[:-1].iterrows():
@@ -127,14 +156,12 @@ class PriceActionScalperCacheEngine:
                 "vol": int(trigger_row["volume"])
             }
 
-            # 2. Normalized 100 แท่ง
             min_100 = float(completed_df["low"].min())
             max_100 = float(completed_df["high"].max())
             rng_100 = max_100 - min_100 if max_100 > min_100 else 1.0
             norm_closes = [round((float(c) - min_100) / rng_100, 3) for c in completed_df["close"]]
             current_close = float(completed_df.iloc[-1]["close"])
 
-            # 3. ตรวจสอบ Active Position
             active_trade_info = None
             try:
                 if hasattr(self.bridge, "get_positions"):
@@ -225,7 +252,6 @@ class PriceActionScalperCacheEngine:
             decision = json.loads(clean_json)
             decision["latency_seconds"] = round(elapsed, 2)
             
-            # ดึงสถิติ Cache Read จาก API
             usage = data.get("usage", {})
             prompt_details = usage.get("prompt_tokens_details", {})
             cached_tokens = prompt_details.get("cached_tokens", 0)
@@ -246,21 +272,12 @@ class PriceActionScalperCacheEngine:
             return None
 
     def call_ai_decision(self, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        สร้าง Prompt ในสถาปัตยกรรม Prefix-Aligned KV Cache:
-        - Immutable System Rules & Protocols (100% Cacheable Prefix)
-        - Historical Structure Context (Semi-Static Prefix)
-        - Dynamic Realtime Trigger (Suffix ท้ายสุดจุดเดียวที่เปลี่ยน)
-        """
         now = datetime.now()
         minutes_to_add = 5 - (now.minute % 5)
         target_time = (now + timedelta(minutes=minutes_to_add)).replace(second=1, microsecond=0)
         seconds_remaining = (target_time - now).total_seconds()
         timeout_seconds = max(90, min(270, int(seconds_remaining) - 15))
 
-        # -------------------------------------------------------------
-        # 1. IMMUTABLE SYSTEM PROMPT (100% Stable Prefix)
-        # -------------------------------------------------------------
         system_prompt = """You are an elite Institutional Quantitative Price Action Scalper and Risk Manager for Gold (XAUUSD M5).
 Your objective is to capture and protect high-probability intraday scalps of 100 to 500 points (1.00 to 5.00 USD).
 You are evaluated on consistency, disciplined risk-to-reward (>= 1.2), and precision trade management.
@@ -304,9 +321,6 @@ Return PURE JSON ONLY (no markdown code blocks, no backticks, no conversational 
   "reasoning": "<structured quantitative rationale: 1) 100-bar macro, 2) 20-bar candle action, 3) active trade evaluation if any, 4) invalidation level>"
 }"""
 
-        # -------------------------------------------------------------
-        # 2. USER PROMPT: จัดเรียงแบบ Semi-Static Prefix -> Dynamic Suffix
-        # -------------------------------------------------------------
         active_trade_str = json.dumps(ctx.get("active_trade"), indent=1) if ctx.get("active_trade") else "FLAT (No Open Positions)"
 
         user_prompt = f"""[MARKET SPECIFICATION]
@@ -334,10 +348,10 @@ Latest Completed M5 Candle: {json.dumps(ctx['trigger_candle'], separators=(',', 
 Synthesize the immutable methodology, historical structure, and the newly closed M5 bar to output your pure JSON decision:"""
 
         # -------------------------------------------------------------
-        # STEP 1: ลองเรียก Tier-1 Primary Model (gpt-6.1-sol)
+        # STEP 1: ลองเรียก Primary Model (gpt-6-sol) ก่อน
         # -------------------------------------------------------------
-        logging.info(f"⏳ [Tier 1: Primary] เรียก {self.model} (Max Cache Read Architecture)...")
-        sol61_decision = self._call_single_model(
+        logging.info(f"⏳ [Primary Model] เรียก {self.model} (Max Cache Read Architecture)...")
+        sol6_decision = self._call_single_model(
             model_name=self.model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -346,25 +360,24 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             tag=f"Primary-{self.model}"
         )
 
-        if sol61_decision:
-            sol61_decision["model_used"] = self.model
-            sol61_decision["tier"] = 1
-            sol61_decision["emergency_mode"] = False
-            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-1 Primary Model ({self.model})")
-            return sol61_decision
+        if sol6_decision:
+            sol6_decision["model_used"] = self.model
+            sol6_decision["tier"] = 1
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Primary Model ({self.model})")
+            return sol6_decision
 
         # -------------------------------------------------------------
-        # STEP 2: Tier-2 Secondary Model (gpt-6-sol)
+        # STEP 2: หาก 6 sol ขัดข้อง สลับไปเรียก Secondary Model (gpt-6.1-sol)
         # -------------------------------------------------------------
         logging.warning("=" * 65)
-        logging.warning(f"⚠️ [TIER 1 FAILED] {self.model} ขัดข้องหรือไม่ตอบสนอง!")
-        logging.warning(f"🔄 [Tier 2: Fallback] สลับไปเรียก {self.secondary_model}...")
+        logging.warning(f"⚠️ [PRIMARY FAILED] {self.model} ขัดข้องหรือไม่ตอบสนอง!")
+        logging.warning(f"🔄 [Secondary Fallback] สลับไปเรียก {self.secondary_model}...")
         logging.warning("=" * 65)
 
         now_t2 = datetime.now()
         seconds_left_t2 = max(45, int((target_time - now_t2).total_seconds()) - 10)
 
-        sol6_decision = self._call_single_model(
+        sol61_decision = self._call_single_model(
             model_name=self.secondary_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -373,108 +386,36 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             tag=f"Secondary-{self.secondary_model}"
         )
 
-        if sol6_decision:
-            sol6_decision["model_used"] = f"{self.secondary_model} (Tier 2 Fallback)"
-            sol6_decision["tier"] = 2
-            sol6_decision["emergency_mode"] = False
-            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Tier-2 Secondary Model ({self.secondary_model})")
-            return sol6_decision
+        if sol61_decision:
+            sol61_decision["model_used"] = f"{self.secondary_model} (Fallback)"
+            sol61_decision["tier"] = 2
+            logging.info(f"✅ สำเร็จ: ได้รับคำตอบจาก Secondary Model ({self.secondary_model})")
+            return sol61_decision
 
         # -------------------------------------------------------------
-        # STEP 3: Tier-3 Emergency Consensus (gpt-6-luna x 2)
+        # STEP 3: หากทั้งสองตัวใช้ไม่ได้ -> SKIP ทันทีตามคำสั่งผู้ใช้
         # -------------------------------------------------------------
         logging.warning("=" * 65)
-        logging.warning(f"🚨 [EMERGENCY PROTOCOL ACTIVATED] ทั้ง {self.model} และ {self.secondary_model} ใช้งานไม่ได้!")
-        logging.warning(f"👥 [Tier 3: Emergency] เรียกใช้งาน {self.emergency_model} แบบคู่ขนาน 2 ตัวเพื่อทำ Consensus Verification...")
+        logging.warning(f"🚨 [ALL TIERS FAILED] ทั้ง {self.model} และ {self.secondary_model} ใช้งานไม่ได้!")
+        logging.warning("⏭️ มาตรการระบุ: หากทั้ง 6 sol และ 6.1 sol ใช้ไม่ได้ ให้ SKIP รอบนี้ทันที ไม่เปิดออเดอร์ใหม่")
         logging.warning("=" * 65)
 
-        now3 = datetime.now()
-        seconds_left_t3 = max(30, int((target_time - now3).total_seconds()) - 10)
-
-        def _worker(instance_id: int):
-            return instance_id, self._call_single_model(
-                model_name=self.emergency_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                timeout_seconds=seconds_left_t3,
-                reasoning_effort="xhigh",
-                tag=f"Luna-#{instance_id}"
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(_worker, 1), executor.submit(_worker, 2)]
-            results = {}
-            for fut in as_completed(futures):
-                try:
-                    i_id, dec = fut.result()
-                    results[i_id] = dec
-                except Exception as e:
-                    logging.error(f"❌ Luna worker error: {e}")
-
-        dec1 = results.get(1)
-        dec2 = results.get(2)
-
-        if not dec1 or not dec2:
-            logging.error(f"❌ [EMERGENCY FAILED] gpt-6-luna ตอบกลับไม่ครบทั้งสองตัว")
-            is_in_trade = bool(ctx.get("active_trade"))
-            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
-            return {
-                "action": safe_action,
-                "confidence": 0.0,
-                "sl_points": None,
-                "tp_points": None,
-                "new_sl": None,
-                "new_tp": None,
-                "market_regime": "Emergency Instances Incomplete",
-                "reasoning": "All upstream tiers failed and emergency Luna instances did not complete both responses. Safeguard maintains safe hold stance.",
-                "model_used": "Emergency Failed -> Safe Hold",
-                "tier": 3,
-                "emergency_mode": True
-            }
-
-        act1 = dec1.get("action", "").upper()
-        act2 = dec2.get("action", "").upper()
-        conf1 = dec1.get("confidence", 0.0)
-        conf2 = dec2.get("confidence", 0.0)
-
-        logging.info(f"🔍 [Consensus Evaluation] Luna #1: {act1} (Conf: {conf1:.2f}) vs Luna #2: {act2} (Conf: {conf2:.2f})")
-
-        if act1 == act2:
-            logging.info(f"🤝 [CONSENSUS AGREED] AI ทั้ง 2 ตัวเห็นตรงกันเป็นเอกฉันท์: {act1}")
-            final_decision = dec1.copy()
-            final_decision["model_used"] = f"{self.emergency_model} x2 (Tier 3 Consensus: {act1})"
-            final_decision["tier"] = 3
-            final_decision["emergency_mode"] = True
-            final_decision["consensus_agreed"] = True
-            final_decision["luna1_action"] = act1
-            final_decision["luna2_action"] = act2
-            final_decision["luna1_conf"] = conf1
-            final_decision["luna2_conf"] = conf2
-            final_decision["reasoning"] = f"[Luna-1 (Leader)]: {dec1.get('reasoning')} | [Luna-2 (Consensus Verified)]: {dec2.get('reasoning')}"
-            return final_decision
-        else:
-            logging.warning(f"⚠️ [CONSENSUS DIVERGENCE] ความเห็นไม่ตรงกัน ({act1} != {act2}) -> สั่งระงับการเทรดเพื่อความปลอดภัย")
-            is_in_trade = bool(ctx.get("active_trade"))
-            safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
-            return {
-                "action": safe_action,
-                "confidence": 0.0,
-                "sl_points": None,
-                "tp_points": None,
-                "new_sl": None,
-                "new_tp": None,
-                "market_regime": f"Consensus Split: Luna1={act1} vs Luna2={act2}",
-                "reasoning": f"Emergency consensus divergence: Luna #1 decided {act1}, whereas Luna #2 decided {act2}. As both instances did not reach unanimous agreement, the system holds position / flat.",
-                "model_used": f"{self.emergency_model} x2 (Tier 3 Split: {act1}/{act2} -> Safe Hold)",
-                "tier": 3,
-                "emergency_mode": True,
-                "consensus_agreed": False
-            }
+        is_in_trade = bool(ctx.get("active_trade"))
+        safe_action = "HOLD_POSITION" if is_in_trade else "HOLD"
+        return {
+            "action": safe_action,
+            "confidence": 0.0,
+            "sl_points": None,
+            "tp_points": None,
+            "new_sl": None,
+            "new_tp": None,
+            "market_regime": "All Models Unavailable - Cycle Skipped",
+            "reasoning": f"Both primary ({self.model}) and secondary ({self.secondary_model}) models failed to respond. Protocol skipped this cycle to ensure account safety.",
+            "model_used": "All Models Failed -> Skipped",
+            "tier": 0
+        }
 
     def execute_decision(self, decision: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> bool:
-        """
-        ตรวจสอบเงื่อนไขความปลอดภัยและส่งออเดอร์/จัดการออเดอร์ไปยัง MT5 ผ่าน Remote Bridge
-        """
         action = decision.get("action", "HOLD").upper()
         confidence = decision.get("confidence", 0.0)
         reasoning = decision.get("reasoning", "")
@@ -489,7 +430,6 @@ Synthesize the immutable methodology, historical structure, and the newly closed
         logging.info(f"📊 AI Decision: {action} (Conf: {confidence:.2f}) | Model: {model_used}{cache_info} | Regime: {decision.get('market_regime')}")
         logging.info(f"💡 Rationale: {reasoning}")
 
-        # 1. HOLD หรือ HOLD_POSITION
         if action in ["HOLD", "HOLD_POSITION"]:
             if active_trade:
                 logging.info(f"⏸️ AI สั่ง HOLD_POSITION -> ถือออเดอร์ #{active_trade.get('ticket')} ต่อไปตามแผน (PnL: {active_trade.get('pnl_points')} pts)")
@@ -497,7 +437,6 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 logging.info("⏸️ Action เป็น HOLD -> สภาวะตลาดยังไม่ชัดเจน ไม่เปิดออเดอร์ใหม่")
             return True
 
-        # 2. CLOSE_POSITION หรือ CLOSE_ALL
         if action in ["CLOSE_POSITION", "CLOSE_ALL"]:
             if active_trade:
                 t_id = active_trade.get("ticket")
@@ -516,7 +455,6 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 logging.info("ℹ️ ไม่มีออเดอร์เปิดอยู่ จึงไม่ต้องปิด")
                 return True
 
-        # 3. MODIFY_SLTP (ปรับ Trailing Stop หรือเลื่อนไป Breakeven)
         if action == "MODIFY_SLTP":
             if not active_trade:
                 logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่มีออเดอร์เปิดอยู่")
@@ -537,7 +475,6 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             if new_tp is not None:
                 new_tp = round(float(new_tp), 2)
 
-            # Safety Guard: ห้ามขยาย Stop Loss (ขยับได้เฉพาะทางที่ลดความเสี่ยงเท่านั้น)
             if cur_sl is not None and cur_sl > 0:
                 if dir_pos == "BUY" and new_sl < cur_sl:
                     logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ BUY ({new_sl} < {cur_sl})")
@@ -559,7 +496,6 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 logging.error(f"❌ แก้ไข SL/TP ล้มเหลว: {res}")
                 return False
 
-        # 4. BUY หรือ SELL (เปิดออเดอร์ใหม่)
         if action in ["BUY", "SELL"]:
             if active_trade:
                 logging.info(f"⚠️ มีออเดอร์ #{active_trade.get('ticket')} เปิดอยู่แล้ว -> ข้ามการเปิดใหม่เพื่อคุมความเสี่ยง")
@@ -630,7 +566,15 @@ Synthesize the immutable methodology, historical structure, and the newly closed
         local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.info("=" * 60)
         logging.info(f"🔄 เริ่มรอบการทำงาน (Cache Edition): {local_time_str} (เวลาเครื่อง)")
-        
+
+        # 1. ตรวจสอบว่าตลาดเปิดทำการอยู่หรือไม่
+        is_open, market_reason = self.is_market_open()
+        if not is_open:
+            logging.info(f"⏸️ [MARKET CLOSED] ตลาด {self.symbol} ปิดทำการ ({market_reason})")
+            logging.info("💤 ข้ามการเรียก AI ในรอบนี้เพื่อประหยัดเครดิตและป้องกันข้อผิดพลาด")
+            return False
+
+        # 2. เตรียม Context ข้อมูลตลาด
         ctx = self.prepare_market_context()
         if not ctx:
             logging.warning("⚠️ ข้อมูลไม่พร้อม ข้ามรอบนี้")
