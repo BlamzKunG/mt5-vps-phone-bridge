@@ -203,10 +203,11 @@ class RemoteMT5Bridge:
         volume: float = 0.01,
         sl: Optional[float] = None,
         tp: Optional[float] = None,
+        magic: int = 123456,
         comment: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Alias สำหรับ open_position"""
-        return self.open_position(direction=action, lot=volume, sl=sl, tp=tp, symbol=symbol, comment=comment)
+        """Alias สำหรับ open_position พร้อมระบุ Magic Number"""
+        return self.open_position(direction=action, lot=volume, sl=sl, tp=tp, symbol=symbol, magic=magic, comment=comment)
 
     def open_position(
         self,

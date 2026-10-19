@@ -45,6 +45,46 @@ if os.path.exists(env_file):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
+# ตารางนโยบายบริหารออเดอร์พร้อมกันหลาย Magic Number (Multi-Order Matrix A/B/C Testing)
+ORDER_POLICIES = {
+    123456: {
+        "name": "LLM Autonomous",
+        "tag": "LLM",
+        "description": "คำสั่งอิสระโดย AI LLM ทั้งหมด (ถือ, ปรับ SL, ปิดฉุกเฉิน)",
+        "tp_extended": False,
+    },
+    2222: {
+        "name": "50% TP Breakeven",
+        "tag": "BE50",
+        "description": "เลื่อน SL ไป BE (+20 pts) เมื่อกำไร >= 50% ของ TP",
+        "tp_extended": False,
+    },
+    3333: {
+        "name": "Fast Step Trailing",
+        "tag": "FastTrail",
+        "description": "Step Trail เริ่มที่ 100 pts ขยับก้าวละ 50 pts",
+        "tp_extended": False,
+    },
+    4444: {
+        "name": "ATR Dynamic Volatility",
+        "tag": "ATRTrail",
+        "description": "Trailing SL ที่ระยะ 1.5x ATR(14) ของกรอบ M5",
+        "tp_extended": False,
+    },
+    6666: {
+        "name": "Structural Swing Pivot",
+        "tag": "SwingTrail",
+        "description": "Trailing SL ตามปลายไส้แท่ง M5 ล่าสุด (Low BUY / High SELL)",
+        "tp_extended": False,
+    },
+    7777: {
+        "name": "Asymmetric Big-Runner",
+        "tag": "BigRunner",
+        "description": "TP ขยาย 800 pts, เลื่อน BE ที่ 50% TP เดิม, ล็อค 200 pts ที่ 400 pts",
+        "tp_extended": True,
+    }
+}
+
 class PriceActionScalperCacheEngine:
     def __init__(
         self,
@@ -75,9 +115,12 @@ class PriceActionScalperCacheEngine:
         self.max_sl_tp_points = max_sl_tp_points
         self.dry_run = dry_run
 
+        self.order_policies = ORDER_POLICIES
+        self.last_context: Optional[Dict[str, Any]] = None
         self.last_processed_candle_time: Optional[str] = None
         logging.info("⚡ [CACHE EDITION] Price Action Scalper Engine Initialized")
         logging.info(f"Target: {self.symbol} | Primary: {self.model} | Secondary: {self.secondary_model} | Failover: Skip")
+        logging.info(f"Multi-Order Matrix Enabled: {list(self.order_policies.keys())}")
 
     def is_market_open(self) -> Tuple[bool, str]:
         """
@@ -162,15 +205,36 @@ class PriceActionScalperCacheEngine:
             norm_closes = [round((float(c) - min_100) / rng_100, 3) for c in completed_df["close"]]
             current_close = float(completed_df.iloc[-1]["close"])
 
+            # คำนวณ ATR 14 บนแท่งเทียน M5 ที่ปิดแล้ว
+            highs = completed_df["high"].values
+            lows = completed_df["low"].values
+            closes = completed_df["close"].values
+            tr_list = []
+            for i in range(1, len(completed_df)):
+                tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+                tr_list.append(tr)
+            atr_14 = float(pd.Series(tr_list[-14:]).mean()) if len(tr_list) >= 14 else 1.5
+
+            last_bar_info = {
+                "high": float(highs[-1]),
+                "low": float(lows[-1]),
+                "close": float(closes[-1]),
+                "time": str(completed_df.iloc[-1]["timestamp"])[-8:]
+            }
+
+            # 3. ตรวจสอบ Active Positions ทั้งหมดสำหรับ Multi-Order Matrix
             active_trade_info = None
+            open_positions = []
             try:
                 if hasattr(self.bridge, "get_positions"):
                     open_positions = self.bridge.get_positions(symbol=self.symbol)
                 else:
                     open_positions = self.bridge.get_open_positions(symbol=self.symbol)
                 
-                if open_positions:
-                    pos = open_positions[0]
+                # ค้นหา Position สำหรับ Magic 123456 (LLM Autonomous) ส่งให้ AI จัดการ
+                llm_positions = [p for p in open_positions if p.get("magic") == 123456]
+                if llm_positions:
+                    pos = llm_positions[0]
                     t_id = pos.get("ticket") or pos.get("id")
                     dir_pos = pos.get("direction", "BUY").upper()
                     entry_p = float(pos.get("entry_price", current_close))
@@ -184,6 +248,7 @@ class PriceActionScalperCacheEngine:
 
                     active_trade_info = {
                         "ticket": t_id,
+                        "magic": 123456,
                         "direction": dir_pos,
                         "lot": float(pos.get("lot", self.lot_size)),
                         "entry_price": entry_p,
@@ -204,7 +269,10 @@ class PriceActionScalperCacheEngine:
                 "norm_closes": norm_closes,
                 "preceding_19": preceding_19,
                 "trigger_candle": trigger_candle,
-                "active_trade": active_trade_info
+                "active_trade": active_trade_info,
+                "atr_14": round(atr_14, 2),
+                "last_bar": last_bar_info,
+                "all_positions": open_positions
             }
         except Exception as e:
             logging.error(f"❌ เกิดข้อผิดพลาดในการเตรียม Context ข้อมูล: {e}")
@@ -438,9 +506,21 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             return True
 
         if action in ["CLOSE_POSITION", "CLOSE_ALL"]:
-            if active_trade:
+            if action == "CLOSE_ALL":
+                logging.info("🧹 ได้รับคำสั่ง CLOSE_ALL -> ปิดทุกออเดอร์ที่เปิดอยู่ทั้งหมด...")
+                all_pos = ctx.get("all_positions", []) if ctx else []
+                closed_count = 0
+                for p in all_pos:
+                    p_ticket = p.get("ticket") or p.get("id")
+                    if p_ticket:
+                        res = self.bridge.close_position(ticket=p_ticket, symbol=self.symbol)
+                        if res and res.get("status") == "SUCCESS":
+                            closed_count += 1
+                logging.info(f"✅ สั่งปิดเรียบร้อย {closed_count} ออเดอร์")
+                return True
+            elif active_trade:
                 t_id = active_trade.get("ticket")
-                logging.info(f"🧹 AI สั่งปิดออเดอร์ Ticket #{t_id} ทันทีเพื่อรักษากำไร/ตัดความเสี่ยง...")
+                logging.info(f"🧹 AI สั่งปิดออเดอร์ Magic 123456 (Ticket #{t_id}) เพื่อรักษากำไร/ตัดความเสี่ยง...")
                 if self.dry_run:
                     logging.info(f"🧪 [DRY RUN] จำลองปิดออเดอร์ #{t_id} สำเร็จ")
                     return True
@@ -452,12 +532,12 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                     logging.error(f"❌ ปิดออเดอร์ล้มเหลว: {res}")
                     return False
             else:
-                logging.info("ℹ️ ไม่มีออเดอร์เปิดอยู่ จึงไม่ต้องปิด")
+                logging.info("ℹ️ ไม่มีออเดอร์ Magic 123456 เปิดอยู่ จึงไม่ต้องปิด")
                 return True
 
         if action == "MODIFY_SLTP":
             if not active_trade:
-                logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่มีออเดอร์เปิดอยู่")
+                logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่มีออเดอร์ Magic 123456 เปิดอยู่")
                 return False
 
             t_id = active_trade.get("ticket")
@@ -483,7 +563,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                     logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ SELL ({new_sl} > {cur_sl})")
                     return False
 
-            logging.info(f"🛡️ ปรับปรุงความเสี่ยงออเดอร์ #{t_id} -> SL ใหม่: {new_sl} (เดิม: {cur_sl}) | TP ใหม่: {new_tp}")
+            logging.info(f"🛡️ [Magic 123456 LLM] ปรับ SL/TP ออเดอร์ #{t_id} -> SL ใหม่: {new_sl} (เดิม: {cur_sl}) | TP ใหม่: {new_tp}")
             if self.dry_run:
                 logging.info(f"🧪 [DRY RUN] จำลองแก้ไข SL/TP สำเร็จ: #{t_id}")
                 return True
@@ -498,7 +578,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
 
         if action in ["BUY", "SELL"]:
             if active_trade:
-                logging.info(f"⚠️ มีออเดอร์ #{active_trade.get('ticket')} เปิดอยู่แล้ว -> ข้ามการเปิดใหม่เพื่อคุมความเสี่ยง")
+                logging.info(f"⚠️ มีออเดอร์ Magic 123456 (#{active_trade.get('ticket')}) เปิดอยู่แล้ว -> ข้ามการเปิดใหม่เพื่อคุมความเสี่ยง")
                 return False
 
             price_info = self.bridge.get_current_price(symbol=self.symbol)
@@ -529,38 +609,186 @@ Synthesize the immutable methodology, historical structure, and the newly closed
 
             logging.info(f"🛡️ Safety Guard Checked: {action} @ {entry_price} | SL: {sl_price} ({sl_points} pts) | TP: {tp_price} ({tp_points} pts)")
 
-            if self.dry_run:
-                logging.info(f"🧪 [DRY RUN] จำลองส่งออเดอร์สำเร็จ: {action} {self.lot_size} lot @ {entry_price}")
-                return True
+            all_pos = ctx.get("all_positions", []) if ctx else []
+            open_magics = {p.get("magic") for p in all_pos if p.get("magic") is not None}
 
-            if hasattr(self.bridge, "send_order"):
-                result = self.bridge.send_order(
+            opened_tickets = []
+            for magic, policy in self.order_policies.items():
+                if magic in open_magics:
+                    logging.info(f"ℹ️ [Matrix Skip] Magic {magic} ({policy['name']}) มีออเดอร์เปิดค้างอยู่แล้ว")
+                    continue
+
+                if policy.get("tp_extended"):
+                    policy_tp_points = 800
+                    policy_tp_price = round(entry_price + (800 * point_value), 2) if action == "BUY" else round(entry_price - (800 * point_value), 2)
+                else:
+                    policy_tp_points = tp_points
+                    policy_tp_price = tp_price
+
+                comment = f"ScalpCache-{action[:1]}-{policy['tag']}-{sl_points}/{policy_tp_points}"
+
+                if self.dry_run:
+                    sim_ticket = 990000 + magic
+                    logging.info(f"🧪 [DRY RUN] จำลองเปิดออเดอร์ Magic {magic} [{policy['name']}]: {action} {self.lot_size} lot @ {entry_price} | SL: {sl_price} | TP: {policy_tp_price} (#{sim_ticket})")
+                    opened_tickets.append(sim_ticket)
+                    continue
+
+                res = self.bridge.send_order(
                     action=action,
                     symbol=self.symbol,
                     volume=self.lot_size,
                     sl=sl_price,
-                    tp=tp_price,
-                    comment=f"ScalpCache-{action[:1]}-{sl_points}/{tp_points}"
+                    tp=policy_tp_price,
+                    magic=magic,
+                    comment=comment
                 )
-            else:
-                result = self.bridge.open_position(
-                    direction=action,
-                    lot=self.lot_size,
-                    sl=sl_price,
-                    tp=tp_price,
-                    symbol=self.symbol,
-                    comment=f"ScalpCache-{action[:1]}-{sl_points}/{tp_points}"
-                )
+                if res and res.get("status") == "SUCCESS":
+                    t_num = res.get("ticket")
+                    opened_tickets.append(t_num)
+                    logging.info(f"✅ เปิดออเดอร์สำเร็จ! Magic {magic} [{policy['name']}]: Ticket #{t_num} | SL: {sl_price} | TP: {policy_tp_price}")
+                else:
+                    logging.error(f"❌ เปิดออเดอร์ Magic {magic} [{policy['name']}] ล้มเหลว: {res}")
 
-            if result and result.get("status") == "SUCCESS":
-                logging.info(f"✅ เปิดออเดอร์สำเร็จ! Ticket: {result.get('ticket')}")
+            if opened_tickets:
+                logging.info(f"🎯 [Multi-Order Matrix] ส่งออเดอร์ทั้งหมด {len(opened_tickets)} ใบเรียบร้อย! Tickets: {opened_tickets}")
                 return True
             else:
-                logging.error(f"❌ ยิงออเดอร์ล้มเหลว: {result}")
+                logging.warning("⚠️ ไม่มีออเดอร์ใหม่ถูกเปิดในรอบนี้")
                 return False
 
         logging.warning(f"⚠️ ไม่รู้จักคำสั่ง Action: {action}")
         return False
+
+    def manage_rule_based_positions(self, ctx: Optional[Dict[str, Any]] = None) -> int:
+        """
+        ระบบบริหารจัดการออเดอร์ตามกฎเฉพาะของแต่ละ Magic Number (Matrix Lifecycle Management)
+        """
+        try:
+            if hasattr(self.bridge, "get_positions"):
+                positions = self.bridge.get_positions(symbol=self.symbol)
+            else:
+                positions = self.bridge.get_open_positions(symbol=self.symbol)
+        except Exception as e:
+            logging.warning(f"⚠️ ไม่สามารถดึง Positions เพื่อจัดการ Trailing ได้: {e}")
+            return 0
+
+        if not positions:
+            return 0
+
+        price_info = self.bridge.get_current_price(symbol=self.symbol)
+        if not price_info:
+            return 0
+
+        bid = price_info.get("bid", 0.0)
+        ask = price_info.get("ask", 0.0)
+        point_value = 0.01
+
+        atr = 1.5
+        last_bar = None
+        if ctx:
+            atr = ctx.get("atr_14", 1.5)
+            last_bar = ctx.get("last_bar")
+
+        modifications_count = 0
+
+        for pos in positions:
+            magic = pos.get("magic")
+            ticket = pos.get("ticket") or pos.get("id")
+            dir_pos = pos.get("direction", "BUY").upper()
+            entry = float(pos.get("entry_price", 0.0))
+            cur_sl = float(pos.get("sl", 0.0)) if pos.get("sl") is not None else 0.0
+            cur_tp = float(pos.get("tp", 0.0)) if pos.get("tp") is not None else 0.0
+
+            if not ticket or entry <= 0:
+                continue
+
+            if dir_pos == "BUY":
+                profit_points = (bid - entry) / point_value
+                current_p = bid
+            else:
+                profit_points = (entry - ask) / point_value
+                current_p = ask
+
+            # Magic 2222: 50% TP Breakeven
+            if magic == 2222:
+                tp_dist_pts = abs(cur_tp - entry) / point_value if cur_tp > 0 else 300.0
+                if profit_points >= 0.5 * tp_dist_pts:
+                    be_sl = round(entry + (20 * point_value), 2) if dir_pos == "BUY" else round(entry - (20 * point_value), 2)
+                    should_modify = (cur_sl < be_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or cur_sl > be_sl)
+                    if should_modify:
+                        logging.info(f"🎯 [Magic 2222 BE50] Ticket #{ticket} กำไรแตะ 50% TP ({profit_points:.1f} pts >= {0.5*tp_dist_pts:.1f} pts) -> ปรับ SL ไปยัง BE (+20 pts): {be_sl}")
+                        if not self.dry_run:
+                            res = self.bridge.modify_position(ticket=ticket, new_sl=be_sl, new_tp=cur_tp)
+                            if res and res.get("status") == "SUCCESS":
+                                modifications_count += 1
+
+            # Magic 3333: Fast Step Trailing Stop (Start 100 pts, Step 50 pts)
+            elif magic == 3333:
+                if profit_points >= 100.0:
+                    steps = int(profit_points) // 50
+                    locked_pts = (steps - 1) * 50
+                    trail_sl = round(entry + (locked_pts * point_value), 2) if dir_pos == "BUY" else round(entry - (locked_pts * point_value), 2)
+                    should_modify = (trail_sl > cur_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or trail_sl < cur_sl)
+                    if should_modify:
+                        logging.info(f"⚡ [Magic 3333 FastTrail] Ticket #{ticket} กำไร {profit_points:.1f} pts -> Step Trail ขยับ SL ไปที่ {trail_sl} (ล็อคกำไร: +{locked_pts} pts)")
+                        if not self.dry_run:
+                            res = self.bridge.modify_position(ticket=ticket, new_sl=trail_sl, new_tp=cur_tp)
+                            if res and res.get("status") == "SUCCESS":
+                                modifications_count += 1
+
+            # Magic 4444: ATR Dynamic Volatility Trailing (1.5x ATR)
+            elif magic == 4444:
+                trail_dist = max(1.0, min(3.5, 1.5 * atr))
+                if profit_points >= 80.0:
+                    trail_sl = round(current_p - trail_dist, 2) if dir_pos == "BUY" else round(current_p + trail_dist, 2)
+                    should_modify = (trail_sl > cur_sl + 0.15 and trail_sl > entry) if dir_pos == "BUY" else ((cur_sl == 0.0 or trail_sl < cur_sl - 0.15) and trail_sl < entry)
+                    if should_modify:
+                        logging.info(f"🌊 [Magic 4444 ATRTrail] Ticket #{ticket} กำไร {profit_points:.1f} pts -> Trail SL (1.5xATR: {trail_dist:.2f}) ไปที่ {trail_sl}")
+                        if not self.dry_run:
+                            res = self.bridge.modify_position(ticket=ticket, new_sl=trail_sl, new_tp=cur_tp)
+                            if res and res.get("status") == "SUCCESS":
+                                modifications_count += 1
+
+            # Magic 6666: Structural Swing Pivot Trailing (Wick of previous M5)
+            elif magic == 6666 and last_bar:
+                if dir_pos == "BUY":
+                    swing_sl = round(last_bar["low"] - (10 * point_value), 2)
+                    should_modify = (swing_sl > cur_sl and swing_sl > entry)
+                else:
+                    swing_sl = round(last_bar["high"] + (10 * point_value), 2)
+                    should_modify = (cur_sl == 0.0 or swing_sl < cur_sl) and (swing_sl < entry)
+
+                if should_modify:
+                    logging.info(f"📐 [Magic 6666 SwingTrail] Ticket #{ticket} -> Trail SL ตามไส้ M5 แท่งก่อนหน้า ({last_bar['time']}) ไปที่ {swing_sl}")
+                    if not self.dry_run:
+                        res = self.bridge.modify_position(ticket=ticket, new_sl=swing_sl, new_tp=cur_tp)
+                        if res and res.get("status") == "SUCCESS":
+                            modifications_count += 1
+
+            # Magic 7777: Asymmetric Big-Runner (800 TP, Tiered Locks)
+            elif magic == 7777:
+                target_sl = None
+                tier_desc = ""
+                if profit_points >= 600.0:
+                    target_sl = round(entry + (400 * point_value), 2) if dir_pos == "BUY" else round(entry - (400 * point_value), 2)
+                    tier_desc = "Tier 3 (+400 pts locked)"
+                elif profit_points >= 400.0:
+                    target_sl = round(entry + (200 * point_value), 2) if dir_pos == "BUY" else round(entry - (200 * point_value), 2)
+                    tier_desc = "Tier 2 (+200 pts locked)"
+                elif profit_points >= 150.0:
+                    target_sl = round(entry + (20 * point_value), 2) if dir_pos == "BUY" else round(entry - (20 * point_value), 2)
+                    tier_desc = "Tier 1 (Breakeven +20 pts)"
+
+                if target_sl is not None:
+                    should_modify = (target_sl > cur_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or target_sl < cur_sl)
+                    if should_modify:
+                        logging.info(f"🚀 [Magic 7777 BigRunner] Ticket #{ticket} กำไร {profit_points:.1f} pts -> {tier_desc} ปรับ SL ไปที่ {target_sl}")
+                        if not self.dry_run:
+                            res = self.bridge.modify_position(ticket=ticket, new_sl=target_sl, new_tp=cur_tp)
+                            if res and res.get("status") == "SUCCESS":
+                                modifications_count += 1
+
+        return modifications_count
 
     def run_single_cycle(self) -> bool:
         local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -594,11 +822,15 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             return False
 
         self.last_processed_candle_time = ctx["candle_time"]
+        self.last_context = ctx
         success = self.execute_decision(decision, ctx)
+        
+        # บริหารจัดการ Trailing Stop & Breakeven สำหรับ Rule-Based Matrix
+        self.manage_rule_based_positions(ctx=ctx)
         return success
 
     def run_forever(self, run_immediately: bool = True):
-        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (Cache Edition - ซิงค์เวลาโทรศัพท์ทุก 5 นาที)")
+        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (Cache Edition - ซิงค์เวลาโทรศัพท์ทุก 5 นาที + Sub-loop Trailing 5s)")
         
         if run_immediately:
             logging.info("⚡ รันรอบแรกทันทีเมื่อสตาร์ท...")
@@ -619,7 +851,22 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 wait_s = int(wait_seconds) % 60
                 logging.info(f"⏰ เวลาเครื่อง: {now.strftime('%H:%M:%S')} -> รอบถัดไปคือ {target_time.strftime('%H:%M:%S')} (รออีก {wait_m} นาที {wait_s} วินาที)...")
                 
-                time.sleep(wait_seconds)
+                # Sub-loop: ตรวจสอบและบริหารจัดการ Trailing / BE แบบ Realtime ทุก 5 วินาทีระหว่างรอแท่ง M5 ถัดไป
+                while True:
+                    curr_now = datetime.now()
+                    rem_sec = (target_time - curr_now).total_seconds()
+                    if rem_sec <= 1.0:
+                        if rem_sec > 0:
+                            time.sleep(rem_sec)
+                        break
+                    
+                    sleep_chunk = min(5.0, rem_sec - 0.5)
+                    time.sleep(sleep_chunk)
+                    
+                    is_open, _ = self.is_market_open()
+                    if is_open:
+                        self.manage_rule_based_positions(ctx=getattr(self, "last_context", None))
+
                 self.run_single_cycle()
 
             except KeyboardInterrupt:

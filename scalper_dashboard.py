@@ -22,12 +22,13 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.live import Live
+from rich.rule import Rule
 from rich import box
 from rich.align import Align
 
@@ -47,6 +48,7 @@ class ScalperCLIDashboard:
         self.last_context: Optional[Dict[str, Any]] = None
         self.trade_history: List[Dict[str, Any]] = []
         self.active_position: Optional[Dict[str, Any]] = None
+        self.all_positions: List[Dict[str, Any]] = []
         self.live_price: Optional[Dict[str, Any]] = None
         self.is_market_open: bool = True
         self.market_status_desc: str = "กำลังตรวจสอบ..."
@@ -55,7 +57,7 @@ class ScalperCLIDashboard:
         self.last_processed_slot: Optional[str] = None
 
     def fetch_live_status(self):
-        """ดึงราคา, สถานะตลาด และ Position ล่าสุดจาก MT5"""
+        """ดึงราคา, สถานะตลาด และ Position ล่าสุดจาก MT5 พร้อมเรียก Lifecycle Trailing"""
         try:
             self.is_market_open, self.market_status_desc = self.engine.is_market_open()
             self.live_price = self.engine.bridge.get_current_price(symbol=self.engine.symbol)
@@ -63,7 +65,12 @@ class ScalperCLIDashboard:
                 positions = self.engine.bridge.get_positions(symbol=self.engine.symbol)
             else:
                 positions = self.engine.bridge.get_open_positions(symbol=self.engine.symbol)
+            self.all_positions = positions or []
             self.active_position = positions[0] if positions else None
+
+            # ตรวจสอบและบริหารจัดการ Trailing Stop / BE สำหรับ Multi-Order Matrix
+            if self.is_market_open and self.all_positions:
+                self.engine.manage_rule_based_positions(ctx=getattr(self.engine, "last_context", None))
         except Exception as e:
             self.status_message = f"เชื่อมต่อ VPS ขัดข้อง: {e}"
 
@@ -135,8 +142,8 @@ class ScalperCLIDashboard:
             Layout(name="footer", size=3)
         )
         layout["main"].split_row(
-            Layout(name="ai_panel", ratio=6),
-            Layout(name="market_panel", ratio=4)
+            Layout(name="ai_panel", ratio=5),
+            Layout(name="matrix_panel", ratio=5)
         )
         return layout
 
@@ -216,7 +223,13 @@ class ScalperCLIDashboard:
         p_timer = Panel(timer_text, title="[bold]⏰ NEXT M5 CANDLE[/]", box=box.ROUNDED, border_style="yellow")
 
         # Active Position
-        if self.active_position:
+        if self.all_positions:
+            total_pnl = sum(p.get("pnl", 0.0) for p in self.all_positions)
+            pnl_color = "bold green" if total_pnl >= 0 else "bold red"
+            pos_border = "green" if total_pnl >= 0 else "red"
+            order_count = len(self.all_positions)
+            pos_text = f"[bold]{order_count} Orders Active[/] (Matrix)\nTotal PnL: [{pnl_color}]{total_pnl:+.2f} USD[/]"
+        elif self.active_position:
             p_dir = self.active_position.get("direction", "N/A")
             p_lot = self.active_position.get("lot", 0.01)
             p_entry = self.active_position.get("entry_price", 0.0)
@@ -227,7 +240,7 @@ class ScalperCLIDashboard:
             pos_text = f"[bold]{p_dir} {p_lot} lot[/] @ {p_entry:.2f}{sl_info}\nFloating PnL: [{pnl_color}]{p_pnl:+.2f} USD[/]"
             pos_border = "green" if p_pnl >= 0 else "red"
         else:
-            pos_text = "[dim]ไม่มีออเดอร์เปิดค้าง[/]\n(Scalp 100-500 pts)"
+            pos_text = "[dim]ไม่มีออเดอร์เปิดค้าง[/]\n(Matrix 6 Policies)"
             pos_border = "dim white"
 
         p_pos = Panel(pos_text, title="[bold]💼 ACTIVE POSITION[/]", box=box.ROUNDED, border_style=pos_border)
@@ -297,7 +310,65 @@ class ScalperCLIDashboard:
 
         layout["ai_panel"].update(Panel(decision_text, title=panel_title, box=box.ROUNDED, border_style=ai_panel_border))
 
-        # 4. Main - Right: Recent M5 Candles & Trade History
+        # 4. Main - Right: Multi-Order Matrix & Recent Trade Journal
+        matrix_elements = []
+
+        if self.all_positions:
+            pos_table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False)
+            pos_table.add_column("Ticket", justify="center", style="dim")
+            pos_table.add_column("Magic", justify="center", style="cyan")
+            pos_table.add_column("Policy", justify="left")
+            pos_table.add_column("Dir", justify="center")
+            pos_table.add_column("Entry", justify="right")
+            pos_table.add_column("SL", justify="right")
+            pos_table.add_column("TP", justify="right")
+            pos_table.add_column("PnL ($)", justify="right")
+
+            policy_names = {
+                123456: "LLM Auto",
+                2222: "BE 50% TP",
+                3333: "Fast Trail",
+                4444: "1.5x ATR",
+                6666: "M5 Wick",
+                7777: "Big-Runner"
+            }
+
+            for p in self.all_positions:
+                m_num = p.get("magic", 0)
+                pol_name = policy_names.get(m_num, f"M-{m_num}")
+                p_pnl = p.get("pnl", 0.0)
+                p_color = "bold green" if p_pnl >= 0 else "bold red"
+                p_dir = p.get("direction", "BUY").upper()
+                d_color = "green" if p_dir == "BUY" else "red"
+
+                pos_table.add_row(
+                    str(p.get("ticket", "-")),
+                    str(m_num),
+                    f"[bold white]{pol_name}[/]",
+                    f"[{d_color}]{p_dir}[/]",
+                    f"{p.get('entry_price', 0):.2f}",
+                    f"{p.get('sl', 0):.2f}" if p.get('sl') else "-",
+                    f"{p.get('tp', 0):.2f}" if p.get('tp') else "-",
+                    f"[{p_color}]{p_pnl:+.2f}[/]"
+                )
+            matrix_elements.append(pos_table)
+        else:
+            bp_table = Table(box=box.SIMPLE, expand=True, show_edge=False)
+            bp_table.add_column("Magic", justify="center", style="cyan")
+            bp_table.add_column("Policy", justify="left", style="bold white")
+            bp_table.add_column("Management Strategy", justify="left", style="dim")
+            bp_table.add_row("123456", "LLM Autonomous", "AI manages trade autonomously (tighten SL / exit)")
+            bp_table.add_row("2222", "50% TP Breakeven", "Move SL to BE (+20 pts) when profit >= 50% TP")
+            bp_table.add_row("3333", "Fast Step Trail", "Step trail: starts at 100 pts, trails 50 pt steps")
+            bp_table.add_row("4444", "1.5x ATR Trailing", "Trail SL at 1.5x ATR(14) behind live price")
+            bp_table.add_row("6666", "Swing Pivot Trail", "Trail SL behind previous M5 candle's wick")
+            bp_table.add_row("7777", "Asymmetric Runner", "Extended 800 pt TP, tiered BE & profit locks")
+            matrix_elements.append(bp_table)
+
+        # Divider between Matrix and Journal
+        matrix_elements.append(Rule(title="[dim]Recent Trade Journal[/]", style="dim cyan"))
+
+        # Journal Table
         right_table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False)
         right_table.add_column("Time", justify="center", style="cyan")
         right_table.add_column("Action", justify="center")
@@ -331,7 +402,8 @@ class ScalperCLIDashboard:
         if not self.trade_history:
             right_table.add_row("-", "[dim]รอประวัติรอบแรก[/]", "-", "-", "-")
 
-        layout["market_panel"].update(Panel(right_table, title="[bold]📜 RECENT TRADE JOURNAL[/]", box=box.ROUNDED, border_style="cyan"))
+        matrix_elements.append(right_table)
+        layout["matrix_panel"].update(Panel(Group(*matrix_elements), title="[bold]💼 MULTI-ORDER MATRIX & JOURNAL[/]", box=box.ROUNDED, border_style="cyan"))
 
         # 5. Footer (Status Bar & Hotkeys)
         footer_text = Text()
