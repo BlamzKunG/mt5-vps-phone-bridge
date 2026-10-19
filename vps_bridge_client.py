@@ -179,6 +179,7 @@ class RemoteMT5Bridge:
                         "direction": p["direction"],
                         "lot": p["volume"],
                         "entry_price": p["open_price"],
+                        "current_price": p.get("current_price", p["open_price"]),
                         "sl": p["sl"],
                         "tp": p["tp"],
                         "pnl": p["pnl"],

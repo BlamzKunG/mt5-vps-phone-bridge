@@ -659,9 +659,16 @@ Synthesize the immutable methodology, historical structure, and the newly closed
         logging.warning(f"⚠️ ไม่รู้จักคำสั่ง Action: {action}")
         return False
 
-    def manage_rule_based_positions(self, ctx: Optional[Dict[str, Any]] = None) -> int:
+    def manage_rule_based_positions(self, ctx: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
         """
-        ระบบบริหารจัดการออเดอร์ตามกฎเฉพาะของแต่ละ Magic Number (Matrix Lifecycle Management)
+        ระบบบริหารจัดการออเดอร์ตามกฎเฉพาะของแต่ละ Magic Number (Matrix Lifecycle Management):
+        - Magic 2222: 50% TP Breakeven (เลื่อน SL ไป Entry + 20 pts เมื่อกำไร >= 50% ของ TP)
+        - Magic 3333: Fast Step Trailing Stop (เริ่มที่ 100 pts, ก้าวละ 50 pts)
+        - Magic 4444: ATR Dynamic Volatility Trailing (Trailing SL ที่ระยะ 1.5x ATR(14))
+        - Magic 6666: Structural Swing Pivot Trailing (Trailing SL ตามปลายไส้ M5 แท่งก่อนหน้า)
+        - Magic 7777: Asymmetric Big-Runner (TP 800 pts, เลื่อน BE ที่ 50% TP เดิม, ล็อค 200 pts ที่ 400 pts)
+        (หมายเหตุ: Magic 123456 จัดการโดยตรงผ่าน AI LLM ไม่ถูกปรับในฟังก์ชันนี้)
+        คืนค่า: (จำนวนคำสั่งที่ถูก modify ในรอบนี้, จำนวนออเดอร์ Matrix ที่เปิดค้างอยู่)
         """
         try:
             if hasattr(self.bridge, "get_positions"):
@@ -670,28 +677,38 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 positions = self.bridge.get_open_positions(symbol=self.symbol)
         except Exception as e:
             logging.warning(f"⚠️ ไม่สามารถดึง Positions เพื่อจัดการ Trailing ได้: {e}")
-            return 0
+            return (0, 0)
 
         if not positions:
-            return 0
+            return (0, 0)
 
-        price_info = self.bridge.get_current_price(symbol=self.symbol)
-        if not price_info:
-            return 0
+        # กรองเฉพาะออเดอร์ที่เป็น Matrix Rules เท่านั้น (Magic 2222, 3333, 4444, 6666, 7777)
+        matrix_magics = {2222, 3333, 4444, 6666, 7777}
+        matrix_positions = [p for p in positions if p.get("magic") in matrix_magics]
+        if not matrix_positions:
+            return (0, 0)
 
-        bid = price_info.get("bid", 0.0)
-        ask = price_info.get("ask", 0.0)
         point_value = 0.01
-
         atr = 1.5
         last_bar = None
         if ctx:
             atr = ctx.get("atr_14", 1.5)
             last_bar = ctx.get("last_bar")
 
+        # ตรวจสอบว่าใน position dict มี current_price จาก MT5 ส่งมาพร้อมแล้วหรือไม่
+        # เพื่อลดการเรียก HTTP Request ซ้ำซ้อน ประหยัด CPU และความเร็วตอบสนองระดับ Realtime
+        has_embedded_price = any(p.get("current_price") and p.get("current_price") > 0 for p in matrix_positions)
+        bid = 0.0
+        ask = 0.0
+        if not has_embedded_price:
+            price_info = self.bridge.get_current_price(symbol=self.symbol)
+            if price_info:
+                bid = price_info.get("bid", 0.0)
+                ask = price_info.get("ask", 0.0)
+
         modifications_count = 0
 
-        for pos in positions:
+        for pos in matrix_positions:
             magic = pos.get("magic")
             ticket = pos.get("ticket") or pos.get("id")
             dir_pos = pos.get("direction", "BUY").upper()
@@ -702,19 +719,28 @@ Synthesize the immutable methodology, historical structure, and the newly closed
             if not ticket or entry <= 0:
                 continue
 
-            if dir_pos == "BUY":
-                profit_points = (bid - entry) / point_value
-                current_p = bid
-            else:
-                profit_points = (entry - ask) / point_value
-                current_p = ask
+            # ใช้ current_price จาก MT5 position โดยตรง (BUY = Bid, SELL = Ask)
+            current_p = float(pos.get("current_price", 0.0))
+            if current_p <= 0:
+                current_p = bid if dir_pos == "BUY" else ask
 
-            # Magic 2222: 50% TP Breakeven
+            if current_p <= 0:
+                continue
+
+            # คำนวณ Floating Profit ในหน่วย Points
+            if dir_pos == "BUY":
+                profit_points = (current_p - entry) / point_value
+            else:
+                profit_points = (entry - current_p) / point_value
+
+            # ---------------------------------------------------------
+            # 1. Magic 2222: 50% TP Breakeven
+            # ---------------------------------------------------------
             if magic == 2222:
                 tp_dist_pts = abs(cur_tp - entry) / point_value if cur_tp > 0 else 300.0
                 if profit_points >= 0.5 * tp_dist_pts:
                     be_sl = round(entry + (20 * point_value), 2) if dir_pos == "BUY" else round(entry - (20 * point_value), 2)
-                    should_modify = (cur_sl < be_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or cur_sl > be_sl)
+                    should_modify = (cur_sl < be_sl - 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or cur_sl > be_sl + 0.05)
                     if should_modify:
                         logging.info(f"🎯 [Magic 2222 BE50] Ticket #{ticket} กำไรแตะ 50% TP ({profit_points:.1f} pts >= {0.5*tp_dist_pts:.1f} pts) -> ปรับ SL ไปยัง BE (+20 pts): {be_sl}")
                         if not self.dry_run:
@@ -722,13 +748,15 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                             if res and res.get("status") == "SUCCESS":
                                 modifications_count += 1
 
-            # Magic 3333: Fast Step Trailing Stop (Start 100 pts, Step 50 pts)
+            # ---------------------------------------------------------
+            # 2. Magic 3333: Fast Step Trailing Stop (Start 100 pts, Step 50 pts)
+            # ---------------------------------------------------------
             elif magic == 3333:
                 if profit_points >= 100.0:
                     steps = int(profit_points) // 50
                     locked_pts = (steps - 1) * 50
                     trail_sl = round(entry + (locked_pts * point_value), 2) if dir_pos == "BUY" else round(entry - (locked_pts * point_value), 2)
-                    should_modify = (trail_sl > cur_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or trail_sl < cur_sl)
+                    should_modify = (trail_sl > cur_sl + 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or trail_sl < cur_sl - 0.05)
                     if should_modify:
                         logging.info(f"⚡ [Magic 3333 FastTrail] Ticket #{ticket} กำไร {profit_points:.1f} pts -> Step Trail ขยับ SL ไปที่ {trail_sl} (ล็อคกำไร: +{locked_pts} pts)")
                         if not self.dry_run:
@@ -736,7 +764,9 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                             if res and res.get("status") == "SUCCESS":
                                 modifications_count += 1
 
-            # Magic 4444: ATR Dynamic Volatility Trailing (1.5x ATR)
+            # ---------------------------------------------------------
+            # 3. Magic 4444: ATR Dynamic Volatility Trailing (1.5x ATR)
+            # ---------------------------------------------------------
             elif magic == 4444:
                 trail_dist = max(1.0, min(3.5, 1.5 * atr))
                 if profit_points >= 80.0:
@@ -749,14 +779,16 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                             if res and res.get("status") == "SUCCESS":
                                 modifications_count += 1
 
-            # Magic 6666: Structural Swing Pivot Trailing (Wick of previous M5)
+            # ---------------------------------------------------------
+            # 4. Magic 6666: Structural Swing Pivot Trailing (Wick of previous M5)
+            # ---------------------------------------------------------
             elif magic == 6666 and last_bar:
                 if dir_pos == "BUY":
                     swing_sl = round(last_bar["low"] - (10 * point_value), 2)
-                    should_modify = (swing_sl > cur_sl and swing_sl > entry)
+                    should_modify = (swing_sl > cur_sl + 0.05 and swing_sl > entry)
                 else:
                     swing_sl = round(last_bar["high"] + (10 * point_value), 2)
-                    should_modify = (cur_sl == 0.0 or swing_sl < cur_sl) and (swing_sl < entry)
+                    should_modify = (cur_sl == 0.0 or swing_sl < cur_sl - 0.05) and (swing_sl < entry)
 
                 if should_modify:
                     logging.info(f"📐 [Magic 6666 SwingTrail] Ticket #{ticket} -> Trail SL ตามไส้ M5 แท่งก่อนหน้า ({last_bar['time']}) ไปที่ {swing_sl}")
@@ -765,7 +797,9 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                         if res and res.get("status") == "SUCCESS":
                             modifications_count += 1
 
-            # Magic 7777: Asymmetric Big-Runner (800 TP, Tiered Locks)
+            # ---------------------------------------------------------
+            # 5. Magic 7777: Asymmetric Big-Runner (800 TP, Tiered Locks)
+            # ---------------------------------------------------------
             elif magic == 7777:
                 target_sl = None
                 tier_desc = ""
@@ -780,7 +814,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                     tier_desc = "Tier 1 (Breakeven +20 pts)"
 
                 if target_sl is not None:
-                    should_modify = (target_sl > cur_sl) if dir_pos == "BUY" else (cur_sl == 0.0 or target_sl < cur_sl)
+                    should_modify = (target_sl > cur_sl + 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or target_sl < cur_sl - 0.05)
                     if should_modify:
                         logging.info(f"🚀 [Magic 7777 BigRunner] Ticket #{ticket} กำไร {profit_points:.1f} pts -> {tier_desc} ปรับ SL ไปที่ {target_sl}")
                         if not self.dry_run:
@@ -788,7 +822,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                             if res and res.get("status") == "SUCCESS":
                                 modifications_count += 1
 
-        return modifications_count
+        return (modifications_count, len(matrix_positions))
 
     def run_single_cycle(self) -> bool:
         local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -830,7 +864,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
         return success
 
     def run_forever(self, run_immediately: bool = True):
-        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (Cache Edition - ซิงค์เวลาโทรศัพท์ทุก 5 นาที + Sub-loop Trailing 5s)")
+        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (Cache Edition - Adaptive Turbo Trailing 1.0s / 3.0s)")
         
         if run_immediately:
             logging.info("⚡ รันรอบแรกทันทีเมื่อสตาร์ท...")
@@ -851,21 +885,28 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 wait_s = int(wait_seconds) % 60
                 logging.info(f"⏰ เวลาเครื่อง: {now.strftime('%H:%M:%S')} -> รอบถัดไปคือ {target_time.strftime('%H:%M:%S')} (รออีก {wait_m} นาที {wait_s} วินาที)...")
                 
-                # Sub-loop: ตรวจสอบและบริหารจัดการ Trailing / BE แบบ Realtime ทุก 5 วินาทีระหว่างรอแท่ง M5 ถัดไป
+                active_matrix_count = 0
+                # Sub-loop: ตรวจสอบและบริหารจัดการ Trailing / BE แบบ Adaptive Turbo ระหว่างรอแท่ง M5 ถัดไป
                 while True:
                     curr_now = datetime.now()
                     rem_sec = (target_time - curr_now).total_seconds()
-                    if rem_sec <= 1.0:
+                    if rem_sec <= 0.5:
                         if rem_sec > 0:
                             time.sleep(rem_sec)
                         break
                     
-                    sleep_chunk = min(5.0, rem_sec - 0.5)
+                    # Adaptive Interval:
+                    # ถ้ามีออเดอร์ Matrix -> 1.0 วินาที (Ultra-Fast Trailing ป้องกันการกระชากของราคาทอง)
+                    # ถ้าไม่มีออเดอร์ -> 3.0 วินาที (Eco Mode เซฟแบตโทรศัพท์)
+                    target_interval = 1.0 if active_matrix_count > 0 else 3.0
+                    sleep_chunk = min(target_interval, max(0.1, rem_sec - 0.2))
                     time.sleep(sleep_chunk)
                     
                     is_open, _ = self.is_market_open()
                     if is_open:
-                        self.manage_rule_based_positions(ctx=getattr(self, "last_context", None))
+                        _, active_matrix_count = self.manage_rule_based_positions(ctx=getattr(self, "last_context", None))
+                    else:
+                        active_matrix_count = 0
 
                 self.run_single_cycle()
 
@@ -874,7 +915,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                 break
             except Exception as e:
                 logging.error(f"❌ เกิดข้อผิดพลาดใน Loop: {e}")
-                time.sleep(5)
+                time.sleep(3)
 
 if __name__ == "__main__":
     once = "--once" in sys.argv
