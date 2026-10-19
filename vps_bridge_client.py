@@ -196,6 +196,151 @@ class RemoteMT5Bridge:
         """Alias สำหรับ get_open_positions"""
         return self.get_open_positions(symbol=symbol, magic=magic)
 
+    def get_history_deals(
+        self,
+        symbol: Optional[str] = "XAUUSD",
+        magic: Optional[int] = None,
+        days: int = 7,
+        ticket: Optional[int] = None,
+        position_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        ดึงประวัติการซื้อขายที่ปิด/จับคู่แล้ว (Deals History) จาก MT5 ผ่าน VPS Bridge
+        - symbol: ระบุคู่เงิน เช่น 'XAUUSD' (หรือ None เพื่อดึงทุกคู่เงิน)
+        - magic: กรองตาม Magic Number
+        - days: จำนวนวันย้อนหลัง (ค่าเริ่มต้น 7 วัน)
+        - ticket: กรองเฉพาะ Deal Ticket ที่ระบุ
+        - position_id: กรองเฉพาะ Position Ticket ที่ระบุ
+        """
+        try:
+            params: Dict[str, Any] = {"days": int(days)}
+            if symbol:
+                params["symbol"] = symbol
+            if magic is not None:
+                params["magic"] = int(magic)
+            if ticket is not None:
+                params["ticket"] = int(ticket)
+            if position_id is not None:
+                params["position_id"] = int(position_id)
+
+            resp = self._request("GET", "/api/history", params=params)
+            if resp.status_code == 200:
+                return resp.json().get("deals", [])
+            elif resp.status_code == 404:
+                resp_alt = self._request("GET", "/api/deals", params=params)
+                if resp_alt.status_code == 200:
+                    return resp_alt.json().get("deals", [])
+                logging.warning("⚠️ VPS Server ยังไม่มี Endpoint /api/history (กรุณาอัปเดต vps_mt5_server.py บน VPS แล้วรัน start_server.bat ใหม่)")
+                return []
+            else:
+                logging.error(f"❌ ดึงประวัติ Deals ล้มเหลว: {resp.text}")
+                return []
+        except Exception as e:
+            logging.error(f"❌ ไม่สามารถดึงประวัติ Deals ได้: {e}")
+            return []
+
+    def get_history_orders(
+        self,
+        symbol: Optional[str] = "XAUUSD",
+        magic: Optional[int] = None,
+        days: int = 7,
+        ticket: Optional[int] = None,
+        position_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        ดึงประวัติคำสั่งซื้อขาย (Orders History) ทั้งหมดในอดีตจาก MT5 ผ่าน VPS Bridge
+        """
+        try:
+            params: Dict[str, Any] = {"days": int(days)}
+            if symbol:
+                params["symbol"] = symbol
+            if magic is not None:
+                params["magic"] = int(magic)
+            if ticket is not None:
+                params["ticket"] = int(ticket)
+            if position_id is not None:
+                params["position_id"] = int(position_id)
+
+            resp = self._request("GET", "/api/history_orders", params=params)
+            if resp.status_code == 200:
+                return resp.json().get("orders", [])
+            elif resp.status_code == 404:
+                logging.warning("⚠️ VPS Server ยังไม่มี Endpoint /api/history_orders (กรุณาอัปเดต vps_mt5_server.py บน VPS)")
+                return []
+            else:
+                logging.error(f"❌ ดึงประวัติ Orders ล้มเหลว: {resp.text}")
+                return []
+        except Exception as e:
+            logging.error(f"❌ ไม่สามารถดึงประวัติ Orders ได้: {e}")
+            return []
+
+    def get_closed_trades(
+        self,
+        symbol: Optional[str] = "XAUUSD",
+        magic: Optional[int] = None,
+        days: int = 7
+    ) -> List[Dict[str, Any]]:
+        """
+        ดึงสรุปประวัติออเดอร์ที่ปิดแล้ว (Closed Trades)
+        คำนวณกำไรสุทธิ (Net PnL), จุดเข้า, จุดออก, และเวลาถือครอง
+        """
+        try:
+            params: Dict[str, Any] = {"days": int(days)}
+            if symbol:
+                params["symbol"] = symbol
+            if magic is not None:
+                params["magic"] = int(magic)
+
+            resp = self._request("GET", "/api/closed_trades", params=params)
+            if resp.status_code == 200:
+                return resp.json().get("trades", [])
+
+            # Fallback สังเคราะห์จาก Deals
+            deals = self.get_history_deals(symbol=symbol, magic=magic, days=days)
+            if not deals:
+                return []
+
+            closed_list = []
+            for d in deals:
+                if d.get("entry_type") == "OUT":
+                    closed_list.append({
+                        "ticket": d.get("position_id") or d.get("order"),
+                        "deal_ticket": d.get("ticket"),
+                        "symbol": d.get("symbol"),
+                        "direction": d.get("direction"),
+                        "lot": d.get("volume"),
+                        "close_price": d.get("price"),
+                        "profit": d.get("profit"),
+                        "commission": d.get("commission"),
+                        "swap": d.get("swap"),
+                        "net_pnl": round(d.get("profit", 0.0) + d.get("commission", 0.0) + d.get("swap", 0.0), 2),
+                        "close_time": d.get("time"),
+                        "magic": d.get("magic"),
+                        "comment": d.get("comment")
+                    })
+            return closed_list
+        except Exception as e:
+            logging.error(f"❌ ไม่สามารถดึงสรุป Closed Trades ได้: {e}")
+            return []
+
+    def get_history(
+        self,
+        symbol: Optional[str] = "XAUUSD",
+        magic: Optional[int] = None,
+        days: int = 7
+    ) -> List[Dict[str, Any]]:
+        """Alias สำหรับ get_closed_trades หรือ get_history_deals"""
+        return self.get_closed_trades(symbol=symbol, magic=magic, days=days)
+
+    def get_trade_history(
+        self,
+        symbol: Optional[str] = "XAUUSD",
+        magic: Optional[int] = None,
+        days: int = 7
+    ) -> List[Dict[str, Any]]:
+        """Alias สำหรับ get_closed_trades"""
+        return self.get_closed_trades(symbol=symbol, magic=magic, days=days)
+
     def send_order(
         self,
         action: str,

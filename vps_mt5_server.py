@@ -8,7 +8,7 @@ import os
 import sys
 import logging
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -508,6 +508,194 @@ def get_positions(
             "open_time": datetime.fromtimestamp(pos.time).strftime("%Y-%m-%d %H:%M:%S")
         })
     return {"positions": res}
+
+@app.get("/api/history")
+@app.get("/api/deals")
+def get_history_deals(
+    symbol: Optional[str] = Query(None),
+    magic: Optional[int] = Query(None),
+    days: int = Query(7),
+    ticket: Optional[int] = Query(None),
+    position_id: Optional[int] = Query(None),
+    auth: str = Depends(verify_api_key)
+):
+    """
+    ดึงประวัติ Deals (การซื้อขาย/ปิดออเดอร์ที่เกิดขึ้นแล้ว) จาก MT5 Terminal
+    """
+    if not gateway.ensure_connected():
+        raise HTTPException(status_code=503, detail="MT5 not connected")
+    
+    now = datetime.now()
+    date_from = now - timedelta(days=days)
+    date_to = now + timedelta(days=1)
+    
+    if position_id is not None:
+        deals = mt5.history_deals_get(position=position_id)
+    elif ticket is not None:
+        deals = mt5.history_deals_get(ticket=ticket)
+    else:
+        deals = mt5.history_deals_get(date_from, date_to)
+        
+    if deals is None:
+        return {"deals": []}
+        
+    real_sym = gateway.resolve_symbol(symbol) if symbol else None
+    res = []
+    for d in deals:
+        if real_sym and d.symbol and d.symbol != real_sym:
+            continue
+        if magic is not None and d.magic != magic:
+            continue
+            
+        entry_type = "IN" if d.entry == 0 else ("OUT" if d.entry == 1 else "INOUT")
+        deal_dir = "BUY" if d.type == 0 else ("SELL" if d.type == 1 else "BALANCE")
+        
+        res.append({
+            "ticket": d.ticket,
+            "order": d.order,
+            "position_id": d.position_id,
+            "time": datetime.fromtimestamp(d.time).strftime("%Y-%m-%d %H:%M:%S") if d.time else None,
+            "timestamp": d.time,
+            "direction": deal_dir,
+            "entry_type": entry_type,
+            "symbol": d.symbol,
+            "volume": float(d.volume),
+            "price": float(d.price),
+            "profit": float(d.profit),
+            "commission": float(d.commission),
+            "swap": float(d.swap),
+            "fee": float(d.fee),
+            "magic": d.magic,
+            "comment": d.comment
+        })
+    return {"deals": res}
+
+@app.get("/api/history_orders")
+def get_history_orders(
+    symbol: Optional[str] = Query(None),
+    magic: Optional[int] = Query(None),
+    days: int = Query(7),
+    ticket: Optional[int] = Query(None),
+    position_id: Optional[int] = Query(None),
+    auth: str = Depends(verify_api_key)
+):
+    """
+    ดึงประวัติ Orders ในอดีตจาก MT5 Terminal
+    """
+    if not gateway.ensure_connected():
+        raise HTTPException(status_code=503, detail="MT5 not connected")
+        
+    now = datetime.now()
+    date_from = now - timedelta(days=days)
+    date_to = now + timedelta(days=1)
+    
+    if position_id is not None:
+        orders = mt5.history_orders_get(position=position_id)
+    elif ticket is not None:
+        orders = mt5.history_orders_get(ticket=ticket)
+    else:
+        orders = mt5.history_orders_get(date_from, date_to)
+        
+    if orders is None:
+        return {"orders": []}
+        
+    real_sym = gateway.resolve_symbol(symbol) if symbol else None
+    res = []
+    for o in orders:
+        if real_sym and o.symbol and o.symbol != real_sym:
+            continue
+        if magic is not None and o.magic != magic:
+            continue
+            
+        res.append({
+            "ticket": o.ticket,
+            "position_id": o.position_id,
+            "symbol": o.symbol,
+            "type": "BUY" if o.type == 0 else ("SELL" if o.type == 1 else str(o.type)),
+            "state": o.state,
+            "volume": float(o.volume_initial),
+            "price_open": float(o.price_open),
+            "sl": float(o.sl),
+            "tp": float(o.tp),
+            "magic": o.magic,
+            "comment": o.comment,
+            "time_setup": datetime.fromtimestamp(o.time_setup).strftime("%Y-%m-%d %H:%M:%S") if o.time_setup else None,
+            "time_done": datetime.fromtimestamp(o.time_done).strftime("%Y-%m-%d %H:%M:%S") if o.time_done else None
+        })
+    return {"orders": res}
+
+@app.get("/api/closed_trades")
+def get_closed_trades(
+    symbol: Optional[str] = Query(None),
+    magic: Optional[int] = Query(None),
+    days: int = Query(7),
+    auth: str = Depends(verify_api_key)
+):
+    """
+    ดึงสรุปออเดอร์ที่ปิดเรียบร้อยแล้ว (Closed Positions) จาก Deals
+    """
+    if not gateway.ensure_connected():
+        raise HTTPException(status_code=503, detail="MT5 not connected")
+        
+    now = datetime.now()
+    date_from = now - timedelta(days=days)
+    date_to = now + timedelta(days=1)
+    
+    deals = mt5.history_deals_get(date_from, date_to)
+    if deals is None:
+        return {"trades": []}
+        
+    real_sym = gateway.resolve_symbol(symbol) if symbol else None
+    
+    pos_map: Dict[int, Dict[str, Any]] = {}
+    for d in deals:
+        if real_sym and d.symbol and d.symbol != real_sym:
+            continue
+        if magic is not None and d.magic != magic:
+            continue
+            
+        pos_id = d.position_id
+        if not pos_id:
+            continue
+            
+        if pos_id not in pos_map:
+            pos_map[pos_id] = {
+                "ticket": pos_id,
+                "symbol": d.symbol,
+                "direction": "BUY" if d.type == 0 else "SELL",
+                "volume": float(d.volume),
+                "open_price": None,
+                "close_price": None,
+                "open_time": None,
+                "close_time": None,
+                "profit": 0.0,
+                "commission": 0.0,
+                "swap": 0.0,
+                "magic": d.magic,
+                "comment": d.comment
+            }
+            
+        rec = pos_map[pos_id]
+        rec["commission"] += float(d.commission)
+        rec["swap"] += float(d.swap)
+        rec["profit"] += float(d.profit)
+        
+        if d.entry == 0:
+            rec["open_price"] = float(d.price)
+            rec["open_time"] = datetime.fromtimestamp(d.time).strftime("%Y-%m-%d %H:%M:%S")
+            rec["direction"] = "BUY" if d.type == 0 else "SELL"
+        elif d.entry == 1:
+            rec["close_price"] = float(d.price)
+            rec["close_time"] = datetime.fromtimestamp(d.time).strftime("%Y-%m-%d %H:%M:%S")
+
+    trades = []
+    for pos_id, t in pos_map.items():
+        if t["close_time"] is not None or t["close_price"] is not None:
+            t["net_pnl"] = round(t["profit"] + t["commission"] + t["swap"], 2)
+            trades.append(t)
+            
+    trades.sort(key=lambda x: x["close_time"] or "", reverse=True)
+    return {"trades": trades}
 
 @app.post("/api/order")
 def send_order(req: OrderRequest, auth: str = Depends(verify_api_key)):
