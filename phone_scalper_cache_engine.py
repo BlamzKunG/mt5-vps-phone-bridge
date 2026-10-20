@@ -61,25 +61,25 @@ ORDER_POLICIES = {
     },
     3333: {
         "name": "Fast Step Trailing",
-        "tag": "FastTrail",
+        "tag": "Fast",
         "description": "Step Trail เริ่มที่ 100 pts ขยับก้าวละ 50 pts",
         "tp_extended": False,
     },
     4444: {
         "name": "ATR Dynamic Volatility",
-        "tag": "ATRTrail",
+        "tag": "ATR",
         "description": "Trailing SL ที่ระยะ 1.5x ATR(14) ของกรอบ M5",
         "tp_extended": False,
     },
     6666: {
         "name": "Structural Swing Pivot",
-        "tag": "SwingTrail",
+        "tag": "Swing",
         "description": "Trailing SL ตามปลายไส้แท่ง M5 ล่าสุด (Low BUY / High SELL)",
         "tp_extended": False,
     },
     7777: {
         "name": "Asymmetric Big-Runner",
-        "tag": "BigRunner",
+        "tag": "Runner",
         "description": "TP ขยาย 800 pts, เลื่อน BE ที่ 50% TP เดิม, ล็อค 200 pts ที่ 400 pts",
         "tp_extended": True,
     }
@@ -625,7 +625,7 @@ Synthesize the immutable methodology, historical structure, and the newly closed
                     policy_tp_points = tp_points
                     policy_tp_price = tp_price
 
-                comment = f"ScalpCache-{action[:1]}-{policy['tag']}-{sl_points}/{policy_tp_points}"
+                comment = f"SC-{action[:1]}-{policy['tag']}-{sl_points}/{policy_tp_points}"[:27]
 
                 if self.dry_run:
                     sim_ticket = 990000 + magic
