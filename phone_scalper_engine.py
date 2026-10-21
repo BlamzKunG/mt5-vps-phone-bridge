@@ -49,46 +49,6 @@ if os.path.exists(env_file):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-# ตารางนโยบายบริหารออเดอร์พร้อมกันหลาย Magic Number (Multi-Order Matrix A/B/C Testing)
-ORDER_POLICIES = {
-    123456: {
-        "name": "LLM Autonomous",
-        "tag": "LLM",
-        "description": "คำสั่งอิสระโดย AI LLM ทั้งหมด (ถือ, ปรับ SL, ปิดฉุกเฉิน)",
-        "tp_extended": False,
-    },
-    2222: {
-        "name": "50% TP Breakeven",
-        "tag": "BE50",
-        "description": "เลื่อน SL ไป BE (+20 pts) เมื่อกำไร >= 50% ของ TP",
-        "tp_extended": False,
-    },
-    3333: {
-        "name": "Fast Step Trailing",
-        "tag": "Fast",
-        "description": "Step Trail เริ่มที่ 100 pts ขยับก้าวละ 50 pts",
-        "tp_extended": False,
-    },
-    4444: {
-        "name": "ATR Dynamic Volatility",
-        "tag": "ATR",
-        "description": "Trailing SL ที่ระยะ 1.5x ATR(14) ของกรอบ M5",
-        "tp_extended": False,
-    },
-    6666: {
-        "name": "Structural Swing Pivot",
-        "tag": "Swing",
-        "description": "Trailing SL ตามปลายไส้แท่ง M5 ล่าสุด (Low BUY / High SELL)",
-        "tp_extended": False,
-    },
-    7777: {
-        "name": "Asymmetric Big-Runner",
-        "tag": "Runner",
-        "description": "TP ขยาย 800 pts, เลื่อน BE ที่ 50% TP เดิม, ล็อค 200 pts ที่ 400 pts",
-        "tp_extended": True,
-    }
-}
-
 class PriceActionScalperEngine:
     def __init__(
         self,
@@ -119,13 +79,11 @@ class PriceActionScalperEngine:
         self.max_sl_tp_points = max_sl_tp_points
         self.dry_run = dry_run
 
-        self.order_policies = ORDER_POLICIES
-        self.last_context: Optional[Dict[str, Any]] = None
         self.last_processed_candle_time: Optional[str] = None
         logging.info("🚀 Price Action Scalper Engine Initialized")
         logging.info(f"Target: {self.symbol} | Primary: {self.model} | Secondary: {self.secondary_model} | Failover: Skip")
         logging.info(f"Scalp Bounds: [{self.min_sl_tp_points}, {self.max_sl_tp_points}] points | Dry Run: {self.dry_run}")
-        logging.info(f"Multi-Order Matrix Enabled: {list(self.order_policies.keys())}")
+        logging.info("🎯 Mode: Single LLM Autonomous Order (Magic: 123456)")
 
     def is_market_open(self) -> Tuple[bool, str]:
         """
@@ -211,26 +169,8 @@ class PriceActionScalperEngine:
             norm_closes = [round((float(c) - min_100) / rng_100, 3) for c in completed_df["close"]]
             current_close = float(completed_df.iloc[-1]["close"])
 
-            # คำนวณ ATR 14 บนแท่งเทียน M5 ที่ปิดแล้ว
-            highs = completed_df["high"].values
-            lows = completed_df["low"].values
-            closes = completed_df["close"].values
-            tr_list = []
-            for i in range(1, len(completed_df)):
-                tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-                tr_list.append(tr)
-            atr_14 = float(pd.Series(tr_list[-14:]).mean()) if len(tr_list) >= 14 else 1.5
-
-            last_bar_info = {
-                "high": float(highs[-1]),
-                "low": float(lows[-1]),
-                "close": float(closes[-1]),
-                "time": str(completed_df.iloc[-1]["timestamp"])[-8:]
-            }
-
-            # 3. ตรวจสอบ Active Positions ทั้งหมดสำหรับ Multi-Order Matrix
+            # 3. ตรวจสอบ Active Position สำหรับ Magic 123456 (LLM Order Management)
             active_trade_info = None
-            open_positions = []
             try:
                 if hasattr(self.bridge, "get_positions"):
                     open_positions = self.bridge.get_positions(symbol=self.symbol)
@@ -274,10 +214,7 @@ class PriceActionScalperEngine:
                 "range_100": rng_100,
                 "norm_closes": norm_closes,
                 "detailed_20": detailed_list,
-                "active_trade": active_trade_info,
-                "atr_14": round(atr_14, 2),
-                "last_bar": last_bar_info,
-                "all_positions": open_positions
+                "active_trade": active_trade_info
             }
         except Exception as e:
             logging.error(f"❌ เกิดข้อผิดพลาดในการเตรียม Context ข้อมูล: {e}")
@@ -605,221 +542,42 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
 
             logging.info(f"🛡️ Safety Guard Checked: {action} @ {entry_price} | SL: {sl_price} ({sl_points} pts) | TP: {tp_price} ({tp_points} pts)")
 
-            # ตรวจสอบว่า Magic ไหนเปิดค้างอยู่แล้วบ้าง
-            all_pos = ctx.get("all_positions", []) if ctx else []
-            open_magics = {p.get("magic") for p in all_pos if p.get("magic") is not None}
+            comment = f"Scalp-{action[:1]}-{sl_points}/{tp_points}"[:27]
 
-            opened_tickets = []
-            for magic, policy in self.order_policies.items():
-                if magic in open_magics:
-                    logging.info(f"ℹ️ [Matrix Skip] Magic {magic} ({policy['name']}) มีออเดอร์เปิดค้างอยู่แล้ว")
-                    continue
+            if self.dry_run:
+                logging.info(f"🧪 [DRY RUN] จำลองส่งออเดอร์สำเร็จ: {action} {self.lot_size} lot @ {entry_price} | SL: {sl_price} | TP: {tp_price}")
+                return True
 
-                if policy.get("tp_extended"):
-                    policy_tp_points = 800
-                    policy_tp_price = round(entry_price + (800 * point_value), 2) if action == "BUY" else round(entry_price - (800 * point_value), 2)
-                else:
-                    policy_tp_points = tp_points
-                    policy_tp_price = tp_price
-
-                comment = f"Scalp-{action[:1]}-{policy['tag']}-{sl_points}/{policy_tp_points}"[:27]
-
-                if self.dry_run:
-                    sim_ticket = 990000 + magic
-                    logging.info(f"🧪 [DRY RUN] จำลองเปิดออเดอร์ Magic {magic} [{policy['name']}]: {action} {self.lot_size} lot @ {entry_price} | SL: {sl_price} | TP: {policy_tp_price} (#{sim_ticket})")
-                    opened_tickets.append(sim_ticket)
-                    continue
-
-                res = self.bridge.send_order(
+            if hasattr(self.bridge, "send_order"):
+                result = self.bridge.send_order(
                     action=action,
                     symbol=self.symbol,
                     volume=self.lot_size,
                     sl=sl_price,
-                    tp=policy_tp_price,
-                    magic=magic,
+                    tp=tp_price,
+                    magic=123456,
                     comment=comment
                 )
-                if res and res.get("status") == "SUCCESS":
-                    t_num = res.get("ticket")
-                    opened_tickets.append(t_num)
-                    logging.info(f"✅ เปิดออเดอร์สำเร็จ! Magic {magic} [{policy['name']}]: Ticket #{t_num} | SL: {sl_price} | TP: {policy_tp_price}")
-                else:
-                    logging.error(f"❌ เปิดออเดอร์ Magic {magic} [{policy['name']}] ล้มเหลว: {res}")
+            else:
+                result = self.bridge.open_position(
+                    direction=action,
+                    lot=self.lot_size,
+                    sl=sl_price,
+                    tp=tp_price,
+                    symbol=self.symbol,
+                    magic=123456,
+                    comment=comment
+                )
 
-            if opened_tickets:
-                logging.info(f"🎯 [Multi-Order Matrix] ส่งออเดอร์ทั้งหมด {len(opened_tickets)} ใบเรียบร้อย! Tickets: {opened_tickets}")
+            if result and result.get("status") == "SUCCESS":
+                logging.info(f"✅ เปิดออเดอร์สำเร็จ! Ticket: {result.get('ticket')} (Magic: 123456)")
                 return True
             else:
-                logging.warning("⚠️ ไม่มีออเดอร์ใหม่ถูกเปิดในรอบนี้")
+                logging.error(f"❌ ยิงออเดอร์ล้มเหลว: {result}")
                 return False
 
         logging.warning(f"⚠️ ไม่รู้จักคำสั่ง Action: {action}")
         return False
-
-    def manage_rule_based_positions(self, ctx: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
-        """
-        ระบบบริหารจัดการออเดอร์ตามกฎเฉพาะของแต่ละ Magic Number (Matrix Lifecycle Management):
-        - Magic 2222: 50% TP Breakeven (เลื่อน SL ไป Entry + 20 pts เมื่อกำไร >= 50% ของ TP)
-        - Magic 3333: Fast Step Trailing Stop (เริ่มที่ 100 pts, ก้าวละ 50 pts)
-        - Magic 4444: ATR Dynamic Volatility Trailing (Trailing SL ที่ระยะ 1.5x ATR(14))
-        - Magic 6666: Structural Swing Pivot Trailing (Trailing SL ตามปลายไส้ M5 แท่งก่อนหน้า)
-        - Magic 7777: Asymmetric Big-Runner (TP 800 pts, เลื่อน BE ที่ 50% TP เดิม, ล็อค 200 pts ที่ 400 pts)
-        (หมายเหตุ: Magic 123456 จัดการโดยตรงผ่าน AI LLM ไม่ถูกปรับในฟังก์ชันนี้)
-        คืนค่า: (จำนวนคำสั่งที่ถูก modify ในรอบนี้, จำนวนออเดอร์ Matrix ที่เปิดค้างอยู่)
-        """
-        try:
-            if hasattr(self.bridge, "get_positions"):
-                positions = self.bridge.get_positions(symbol=self.symbol)
-            else:
-                positions = self.bridge.get_open_positions(symbol=self.symbol)
-        except Exception as e:
-            logging.warning(f"⚠️ ไม่สามารถดึง Positions เพื่อจัดการ Trailing ได้: {e}")
-            return (0, 0)
-
-        if not positions:
-            return (0, 0)
-
-        # กรองเฉพาะออเดอร์ที่เป็น Matrix Rules เท่านั้น (Magic 2222, 3333, 4444, 6666, 7777)
-        matrix_magics = {2222, 3333, 4444, 6666, 7777}
-        matrix_positions = [p for p in positions if p.get("magic") in matrix_magics]
-        if not matrix_positions:
-            return (0, 0)
-
-        point_value = 0.01
-        atr = 1.5
-        last_bar = None
-        if ctx:
-            atr = ctx.get("atr_14", 1.5)
-            last_bar = ctx.get("last_bar")
-
-        # ตรวจสอบว่าใน position dict มี current_price จาก MT5 ส่งมาพร้อมแล้วหรือไม่
-        # เพื่อลดการเรียก HTTP Request ซ้ำซ้อน ประหยัด CPU และความเร็วตอบสนองระดับ Realtime
-        has_embedded_price = any(p.get("current_price") and p.get("current_price") > 0 for p in matrix_positions)
-        bid = 0.0
-        ask = 0.0
-        if not has_embedded_price:
-            price_info = self.bridge.get_current_price(symbol=self.symbol)
-            if price_info:
-                bid = price_info.get("bid", 0.0)
-                ask = price_info.get("ask", 0.0)
-
-        modifications_count = 0
-
-        for pos in matrix_positions:
-            magic = pos.get("magic")
-            ticket = pos.get("ticket") or pos.get("id")
-            dir_pos = pos.get("direction", "BUY").upper()
-            entry = float(pos.get("entry_price", 0.0))
-            cur_sl = float(pos.get("sl", 0.0)) if pos.get("sl") is not None else 0.0
-            cur_tp = float(pos.get("tp", 0.0)) if pos.get("tp") is not None else 0.0
-
-            if not ticket or entry <= 0:
-                continue
-
-            # ใช้ current_price จาก MT5 position โดยตรง (BUY = Bid, SELL = Ask)
-            current_p = float(pos.get("current_price", 0.0))
-            if current_p <= 0:
-                current_p = bid if dir_pos == "BUY" else ask
-
-            if current_p <= 0:
-                continue
-
-            # คำนวณ Floating Profit ในหน่วย Points
-            if dir_pos == "BUY":
-                profit_points = (current_p - entry) / point_value
-            else:
-                profit_points = (entry - current_p) / point_value
-
-            # ---------------------------------------------------------
-            # 1. Magic 2222: 50% TP Breakeven
-            # ---------------------------------------------------------
-            if magic == 2222:
-                tp_dist_pts = abs(cur_tp - entry) / point_value if cur_tp > 0 else 300.0
-                if profit_points >= 0.5 * tp_dist_pts:
-                    be_sl = round(entry + (20 * point_value), 2) if dir_pos == "BUY" else round(entry - (20 * point_value), 2)
-                    should_modify = (cur_sl < be_sl - 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or cur_sl > be_sl + 0.05)
-                    if should_modify:
-                        logging.info(f"🎯 [Magic 2222 BE50] Ticket #{ticket} กำไรแตะ 50% TP ({profit_points:.1f} pts >= {0.5*tp_dist_pts:.1f} pts) -> ปรับ SL ไปยัง BE (+20 pts): {be_sl}")
-                        if not self.dry_run:
-                            res = self.bridge.modify_position(ticket=ticket, new_sl=be_sl, new_tp=cur_tp)
-                            if res and res.get("status") == "SUCCESS":
-                                modifications_count += 1
-
-            # ---------------------------------------------------------
-            # 2. Magic 3333: Fast Step Trailing Stop (Start 100 pts, Step 50 pts)
-            # ---------------------------------------------------------
-            elif magic == 3333:
-                if profit_points >= 100.0:
-                    steps = int(profit_points) // 50
-                    locked_pts = (steps - 1) * 50
-                    trail_sl = round(entry + (locked_pts * point_value), 2) if dir_pos == "BUY" else round(entry - (locked_pts * point_value), 2)
-                    should_modify = (trail_sl > cur_sl + 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or trail_sl < cur_sl - 0.05)
-                    if should_modify:
-                        logging.info(f"⚡ [Magic 3333 FastTrail] Ticket #{ticket} กำไร {profit_points:.1f} pts -> Step Trail ขยับ SL ไปที่ {trail_sl} (ล็อคกำไร: +{locked_pts} pts)")
-                        if not self.dry_run:
-                            res = self.bridge.modify_position(ticket=ticket, new_sl=trail_sl, new_tp=cur_tp)
-                            if res and res.get("status") == "SUCCESS":
-                                modifications_count += 1
-
-            # ---------------------------------------------------------
-            # 3. Magic 4444: ATR Dynamic Volatility Trailing (1.5x ATR)
-            # ---------------------------------------------------------
-            elif magic == 4444:
-                trail_dist = max(1.0, min(3.5, 1.5 * atr))
-                if profit_points >= 80.0:
-                    trail_sl = round(current_p - trail_dist, 2) if dir_pos == "BUY" else round(current_p + trail_dist, 2)
-                    should_modify = (trail_sl > cur_sl + 0.15 and trail_sl > entry) if dir_pos == "BUY" else ((cur_sl == 0.0 or trail_sl < cur_sl - 0.15) and trail_sl < entry)
-                    if should_modify:
-                        logging.info(f"🌊 [Magic 4444 ATRTrail] Ticket #{ticket} กำไร {profit_points:.1f} pts -> Trail SL (1.5xATR: {trail_dist:.2f}) ไปที่ {trail_sl}")
-                        if not self.dry_run:
-                            res = self.bridge.modify_position(ticket=ticket, new_sl=trail_sl, new_tp=cur_tp)
-                            if res and res.get("status") == "SUCCESS":
-                                modifications_count += 1
-
-            # ---------------------------------------------------------
-            # 4. Magic 6666: Structural Swing Pivot Trailing (Wick of previous M5)
-            # ---------------------------------------------------------
-            elif magic == 6666 and last_bar:
-                if dir_pos == "BUY":
-                    swing_sl = round(last_bar["low"] - (10 * point_value), 2)
-                    should_modify = (swing_sl > cur_sl + 0.05 and swing_sl > entry)
-                else:
-                    swing_sl = round(last_bar["high"] + (10 * point_value), 2)
-                    should_modify = (cur_sl == 0.0 or swing_sl < cur_sl - 0.05) and (swing_sl < entry)
-
-                if should_modify:
-                    logging.info(f"📐 [Magic 6666 SwingTrail] Ticket #{ticket} -> Trail SL ตามไส้ M5 แท่งก่อนหน้า ({last_bar['time']}) ไปที่ {swing_sl}")
-                    if not self.dry_run:
-                        res = self.bridge.modify_position(ticket=ticket, new_sl=swing_sl, new_tp=cur_tp)
-                        if res and res.get("status") == "SUCCESS":
-                            modifications_count += 1
-
-            # ---------------------------------------------------------
-            # 5. Magic 7777: Asymmetric Big-Runner (800 TP, Tiered Locks)
-            # ---------------------------------------------------------
-            elif magic == 7777:
-                target_sl = None
-                tier_desc = ""
-                if profit_points >= 600.0:
-                    target_sl = round(entry + (400 * point_value), 2) if dir_pos == "BUY" else round(entry - (400 * point_value), 2)
-                    tier_desc = "Tier 3 (+400 pts locked)"
-                elif profit_points >= 400.0:
-                    target_sl = round(entry + (200 * point_value), 2) if dir_pos == "BUY" else round(entry - (200 * point_value), 2)
-                    tier_desc = "Tier 2 (+200 pts locked)"
-                elif profit_points >= 150.0:
-                    target_sl = round(entry + (20 * point_value), 2) if dir_pos == "BUY" else round(entry - (20 * point_value), 2)
-                    tier_desc = "Tier 1 (Breakeven +20 pts)"
-
-                if target_sl is not None:
-                    should_modify = (target_sl > cur_sl + 0.05) if dir_pos == "BUY" else (cur_sl == 0.0 or target_sl < cur_sl - 0.05)
-                    if should_modify:
-                        logging.info(f"🚀 [Magic 7777 BigRunner] Ticket #{ticket} กำไร {profit_points:.1f} pts -> {tier_desc} ปรับ SL ไปที่ {target_sl}")
-                        if not self.dry_run:
-                            res = self.bridge.modify_position(ticket=ticket, new_sl=target_sl, new_tp=cur_tp)
-                            if res and res.get("status") == "SUCCESS":
-                                modifications_count += 1
-
-        return (modifications_count, len(matrix_positions))
 
     def run_single_cycle(self) -> bool:
         """
@@ -856,22 +614,14 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
             return False
 
         self.last_processed_candle_time = ctx["candle_time"]
-        self.last_context = ctx
-        success = self.execute_decision(decision, ctx)
-        
-        # บริหารจัดการ Trailing Stop & Breakeven สำหรับ Rule-Based Matrix
-        self.manage_rule_based_positions(ctx=ctx)
-        return success
+        return self.execute_decision(decision, ctx)
 
     def run_forever(self, run_immediately: bool = True):
         """
         รันระบบอัตโนมัติต่อเนื่อง 24/7 โดยซิงค์ตามเวลาเครื่องโทรศัพท์ทุก 5 นาทีเป๊ะ
         เช่น 01:00, 01:05, 01:10, 01:15, ... (+ 1 วินาที buffer ให้แท่งปิดสมบูรณ์)
-        พร้อม Sub-loop Trailing Stop / BE ความเร็วสูงระดับ Adaptive Turbo:
-        - เมื่อมีออเดอร์เปิดค้าง: ตรวจสอบและ Trailing ทุก 1.0 วินาที (ตอบสนองไวที่สุดในตลาดทองคำ)
-        - เมื่อไม่มีออเดอร์ค้าง: โหมดประหยัดพลังงาน ตรวจสอบทุก 3.0 วินาที (ไม่กิน CPU / แบตเตอรี่โทรศัพท์)
         """
-        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (Adaptive Turbo Trailing 1.0s / 3.0s)")
+        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (ซิงค์เวลาโทรศัพท์ทุก 5 นาที | Magic: 123456)")
         
         if run_immediately:
             logging.info("⚡ รันรอบแรกทันทีเมื่อสตาร์ท...")
@@ -892,29 +642,7 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
                 wait_s = int(wait_seconds) % 60
                 logging.info(f"⏰ เวลาเครื่อง: {now.strftime('%H:%M:%S')} -> รอบถัดไปคือ {target_time.strftime('%H:%M:%S')} (รออีก {wait_m} นาที {wait_s} วินาที)...")
                 
-                active_matrix_count = 0
-                # Sub-loop: ตรวจสอบและบริหารจัดการ Trailing / BE แบบ Adaptive Turbo ระหว่างรอแท่ง M5 ถัดไป
-                while True:
-                    curr_now = datetime.now()
-                    rem_sec = (target_time - curr_now).total_seconds()
-                    if rem_sec <= 0.5:
-                        if rem_sec > 0:
-                            time.sleep(rem_sec)
-                        break
-                    
-                    # Adaptive Interval:
-                    # ถ้ามีออเดอร์ Matrix -> 1.0 วินาที (Ultra-Fast Trailing ป้องกันการกระชากของราคาทอง)
-                    # ถ้าไม่มีออเดอร์ -> 3.0 วินาที (Eco Mode เซฟแบตโทรศัพท์)
-                    target_interval = 1.0 if active_matrix_count > 0 else 3.0
-                    sleep_chunk = min(target_interval, max(0.1, rem_sec - 0.2))
-                    time.sleep(sleep_chunk)
-                    
-                    is_open, _ = self.is_market_open()
-                    if is_open:
-                        _, active_matrix_count = self.manage_rule_based_positions(ctx=getattr(self, "last_context", None))
-                    else:
-                        active_matrix_count = 0
-
+                time.sleep(wait_seconds)
                 self.run_single_cycle()
 
             except KeyboardInterrupt:
@@ -922,7 +650,7 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
                 break
             except Exception as e:
                 logging.error(f"❌ เกิดข้อผิดพลาดใน Loop: {e}")
-                time.sleep(3)
+                time.sleep(5)
 
 if __name__ == "__main__":
     once = "--once" in sys.argv
