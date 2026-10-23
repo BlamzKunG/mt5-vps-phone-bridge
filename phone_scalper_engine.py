@@ -63,6 +63,9 @@ class PriceActionScalperEngine:
         max_spread_points: float = 40.0,
         min_sl_tp_points: int = 100,
         max_sl_tp_points: int = 500,
+        max_recovery_layers: int = 3,
+        max_recovery_lot: float = 0.05,
+        min_recovery_distance_points: float = 80.0,
         dry_run: bool = False
     ):
         self.vps_url = vps_url or os.getenv("VPS_URL", "http://154.197.116.121:8000")
@@ -77,13 +80,17 @@ class PriceActionScalperEngine:
         self.max_spread_points = max_spread_points
         self.min_sl_tp_points = min_sl_tp_points
         self.max_sl_tp_points = max_sl_tp_points
+        self.max_recovery_layers = max_recovery_layers
+        self.max_recovery_lot = max_recovery_lot
+        self.min_recovery_distance_points = min_recovery_distance_points
         self.dry_run = dry_run
 
         self.last_processed_candle_time: Optional[str] = None
         logging.info("🚀 Price Action Scalper Engine Initialized")
         logging.info(f"Target: {self.symbol} | Primary: {self.model} | Secondary: {self.secondary_model} | Failover: Skip")
         logging.info(f"Scalp Bounds: [{self.min_sl_tp_points}, {self.max_sl_tp_points}] points | Dry Run: {self.dry_run}")
-        logging.info("🎯 Mode: Single LLM Autonomous Order (Magic: 123456)")
+        logging.info("🎯 Mode: Dual-Engine [Magic 123456 (Scalp LLM) + Magic 1212 (Recovery LLM - No SL)]")
+        logging.info(f"🛡️ Recovery Config: Max {self.max_recovery_layers} Layers | Max Lot {self.max_recovery_lot} | Min Gap {self.min_recovery_distance_points} pts")
 
     def is_market_open(self) -> Tuple[bool, str]:
         """
@@ -169,15 +176,16 @@ class PriceActionScalperEngine:
             norm_closes = [round((float(c) - min_100) / rng_100, 3) for c in completed_df["close"]]
             current_close = float(completed_df.iloc[-1]["close"])
 
-            # 3. ตรวจสอบ Active Position สำหรับ Magic 123456 (LLM Order Management)
+            # 3. ตรวจสอบ Active Positions สำหรับ Magic 123456 (Scalp) และ Magic 1212 (Recovery)
             active_trade_info = None
+            recovery_basket_info = None
             try:
                 if hasattr(self.bridge, "get_positions"):
                     open_positions = self.bridge.get_positions(symbol=self.symbol)
                 else:
                     open_positions = self.bridge.get_open_positions(symbol=self.symbol)
                 
-                # ค้นหา Position สำหรับ Magic 123456 (LLM Autonomous) ส่งให้ AI จัดการ
+                # 3.1 ค้นหา Position สำหรับ Magic 123456 (LLM Autonomous Scalp)
                 llm_positions = [p for p in open_positions if p.get("magic") == 123456]
                 if llm_positions:
                     pos = llm_positions[0]
@@ -203,6 +211,45 @@ class PriceActionScalperEngine:
                         "current_tp": cur_tp,
                         "pnl_points": pnl_points
                     }
+
+                # 3.2 ค้นหา Basket Positions สำหรับ Magic 1212 (Recovery Engine - No SL)
+                rec_positions = [p for p in open_positions if p.get("magic") == 1212]
+                if rec_positions:
+                    rec_dir = rec_positions[0].get("direction", "BUY").upper()
+                    tot_lot = round(sum(float(p.get("lot", self.lot_size)) for p in rec_positions), 2)
+                    weighted_sum = sum(float(p.get("entry_price", current_close)) * float(p.get("lot", self.lot_size)) for p in rec_positions)
+                    avg_entry = round(weighted_sum / tot_lot, 2) if tot_lot > 0 else current_close
+
+                    if rec_dir == "BUY":
+                        basket_pnl_pts = round((current_close - avg_entry) / 0.01, 1)
+                    else:
+                        basket_pnl_pts = round((avg_entry - current_close) / 0.01, 1)
+
+                    layers_list = []
+                    for idx, p in enumerate(rec_positions, 1):
+                        p_entry = float(p.get("entry_price", current_close))
+                        p_dir = p.get("direction", "BUY").upper()
+                        lyr_pnl = round(((current_close - p_entry) if p_dir == "BUY" else (p_entry - current_close)) / 0.01, 1)
+                        layers_list.append({
+                            "layer": idx,
+                            "ticket": p.get("ticket") or p.get("id"),
+                            "lot": float(p.get("lot", self.lot_size)),
+                            "entry_price": p_entry,
+                            "current_tp": float(p.get("tp", 0.0)) if p.get("tp") is not None else None,
+                            "pnl_points": lyr_pnl
+                        })
+
+                    recovery_basket_info = {
+                        "magic": 1212,
+                        "direction": rec_dir,
+                        "layers_count": len(rec_positions),
+                        "total_lot": tot_lot,
+                        "avg_entry": avg_entry,
+                        "current_price": current_close,
+                        "basket_pnl_points": basket_pnl_pts,
+                        "layers": layers_list
+                    }
+
             except Exception as e:
                 logging.warning(f"⚠️ ตรวจสอบ Active Position ไม่สำเร็จ: {e}")
 
@@ -214,7 +261,9 @@ class PriceActionScalperEngine:
                 "range_100": rng_100,
                 "norm_closes": norm_closes,
                 "detailed_20": detailed_list,
-                "active_trade": active_trade_info
+                "active_trade": active_trade_info,
+                "recovery_basket": recovery_basket_info,
+                "all_positions": open_positions if 'open_positions' in locals() else []
             }
         except Exception as e:
             logging.error(f"❌ เกิดข้อผิดพลาดในการเตรียม Context ข้อมูล: {e}")
@@ -282,9 +331,18 @@ class PriceActionScalperEngine:
         seconds_remaining = (target_time - now).total_seconds()
         timeout_seconds = max(90, min(270, int(seconds_remaining) - 15))
 
-        system_prompt = """You are an elite Institutional Quantitative Price Action Scalper and Risk Manager for Gold (XAUUSD M5).
-Your objective is to capture and protect high-probability intraday scalps of 100 to 500 points (1.00 to 5.00 USD).
-You are evaluated on consistency, disciplined risk-to-reward (>= 1.2), and precision trade management.
+        system_prompt = """You are an elite Institutional Quantitative Price Action Scalper and Dual-Engine Risk Manager for Gold (XAUUSD M5).
+Your objective is to capture high-probability intraday scalps of 100 to 500 points (1.00 to 5.00 USD) and intelligently manage adverse drawdowns via a disciplined recovery engine.
+
+PORTFOLIO & DUAL-ENGINE ARCHITECTURE:
+You manage two parallel execution engines on the same account:
+1. Engine A (Magic 123456 - Autonomous Scalper):
+   - Strict risk control with hard Stop Loss (100 to 500 points) and Take Profit (100 to 500 points).
+   - If in trade, managed via "HOLD_POSITION", "MODIFY_SLTP" (tighten SL / Breakeven), or "CLOSE_POSITION".
+2. Engine B (Magic 1212 - Dynamic Recovery / "ระบบแก้ไม้"):
+   - Opened simultaneously with Engine A upon entry, but has NO Hard Stop Loss (sl = 0).
+   - If price moves against the trade (even if Engine A gets stopped out), Engine B remains alive.
+   - At each closed M5 bar, evaluate whether the market structure justifies opening a recovery order ("เปิดไม้แก้") and whether to increase lot size ("เพิ่ม lot").
 
 CORE METHODOLOGY:
 1. Macro Context (100-bar Normalized Curve [0.00 to 1.00]):
@@ -297,20 +355,26 @@ CORE METHODOLOGY:
 
 DECISION PROTOCOLS:
 
-A. When FLAT (No Active Position):
+A. When FLAT (No Active Positions):
    - If clear confluence emerges: Output "BUY" or "SELL".
-   - Stop Loss (sl_points): 100 to 500 points placed beyond the structural invalidation wick.
-   - Take Profit (tp_points): 100 to 500 points targeting the opposing internal liquidity pool.
-   - If market is choppy, ambiguous, or lacks structural confirmation: Output "HOLD".
+   - sl_points: 100 to 500 points beyond structural invalidation (applied to Magic 123456).
+   - tp_points: 100 to 500 points targeting opposing liquidity (applied to both 123456 and 1212).
+   - recovery_action: "NONE".
 
-B. When IN POSITION (Active Trade Running):
-   - Evaluate trade health based on current price, floating PnL (points), and latest candle structure:
-   - "HOLD_POSITION": The thesis remains healthy; price is moving toward TP or experiencing normal low-volume pullback.
+B. When Magic 123456 is IN POSITION:
+   - "HOLD_POSITION": Thesis remains intact; normal pullback or progressing toward TP.
    - "MODIFY_SLTP": Active risk protection:
-     * If floating profit >= 150 points: Move SL to Breakeven (entry_price + 20 pts for BUY, entry_price - 20 pts for SELL) to lock in a risk-free trade.
-     * If trend made a new structural swing pivot: Trail SL behind the newest M5 swing low (for BUY) or swing high (for SELL).
-     * Rule: You may ONLY tighten SL (lower risk). NEVER widen SL.
-   - "CLOSE_POSITION": Early emergency exit. If an adverse liquidity sweep, opposing CHoCH with strong displacement, or thesis invalidation occurs, exit immediately at market to preserve capital rather than taking full SL.
+     * If floating profit >= 150 points: Move SL to Breakeven (+20 pts).
+     * If new swing pivot formed: Trail SL behind newest M5 swing low (BUY) or swing high (SELL).
+     * Rule: ONLY tighten SL (lower risk). NEVER widen SL.
+   - "CLOSE_POSITION": Early emergency exit for 123456 upon adverse liquidity sweep / opposing CHoCH.
+
+C. When Magic 1212 Recovery Basket is ACTIVE (Evaluate "แก้ไม้"):
+   - "NONE": When no 1212 basket exists.
+   - "HOLD": 1212 basket is running; wait patiently. Do NOT add a layer if adverse momentum is still explosive without a structural reversal trigger.
+   - "ADD_RECOVERY_LAYER": High-confluence reversal zone reached (e.g. key liquidity sweep, opposing order block, rejection pin bar).
+     * recovery_lot: Evaluate whether to keep same lot (0.01) or increase lot (0.02 to 0.03, max 0.05) to pull the basket break-even price closer.
+   - "CLOSE_RECOVERY_BASKET": Emergency cut or basket profit take. If macro structure has completely broken down and holding is existential risk, or basket is already in target profit.
 
 OUTPUT FORMAT REQUIREMENTS:
 Return PURE JSON ONLY (no markdown code blocks, no backticks, no conversational filler):
@@ -321,18 +385,25 @@ Return PURE JSON ONLY (no markdown code blocks, no backticks, no conversational 
   "tp_points": <int 100 to 500 or null>,
   "new_sl": <float or null>,
   "new_tp": <float or null>,
+  "recovery_action": "NONE" | "HOLD" | "ADD_RECOVERY_LAYER" | "CLOSE_RECOVERY_BASKET",
+  "recovery_lot": <float 0.01 to 0.05 or null>,
   "market_regime": "<concise regime description>",
-  "reasoning": "<structured quantitative rationale: 1) 100-bar macro, 2) 20-bar candle action, 3) active trade evaluation if any, 4) invalidation level>"
+  "reasoning": "<structured quantitative rationale: 1) 100-bar macro, 2) 20-bar candle action, 3) 123456 scalp management, 4) 1212 recovery evaluation and lot sizing>"
 }"""
 
         active_trade_str = json.dumps(ctx.get("active_trade"), indent=1) if ctx.get("active_trade") else "FLAT (No Open Positions)"
+        recovery_basket_str = json.dumps(ctx.get("recovery_basket"), indent=1) if ctx.get("recovery_basket") else "FLAT (No Open Basket)"
 
         user_prompt = f"""Asset: {self.symbol} (M5)
 Completed Candle Timestamp: {ctx['candle_time']}
 Latest Closed Price: {ctx['current_price']:.2f}
 
-[ACTIVE POSITION STATUS]
+[PORTFOLIO & POSITION STATUS]
+- Magic 123456 (Autonomous Scalp):
 {active_trade_str}
+
+- Magic 1212 (Recovery Engine - No SL):
+{recovery_basket_str}
 
 [100-Bar Macro Context]
 - 100-Bar Low: {ctx['min_100']:.2f}
@@ -343,7 +414,7 @@ Latest Closed Price: {ctx['current_price']:.2f}
 [20-Bar Detailed M5 OHLCV (Bars -20 to -1)]
 {json.dumps(ctx['detailed_20'], separators=(',', ':'))}
 
-Analyze the market structure, evaluate trade health (if in position) or setup confluence (if flat), and output your pure JSON decision:"""
+Analyze the market structure, evaluate trade health (if in position), setup confluence (if flat), and assess Magic 1212 recovery action & lot sizing. Output your pure JSON decision:"""
 
         # -------------------------------------------------------------
         # STEP 1: ลองเรียก Primary Model (gpt-6-sol) ก่อน
@@ -415,169 +486,247 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
 
     def execute_decision(self, decision: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> bool:
         """
-        ตรวจสอบเงื่อนไขความปลอดภัยและส่งออเดอร์/จัดการออเดอร์ไปยัง MT5 ผ่าน Remote Bridge
+        ตรวจสอบเงื่อนไขความปลอดภัยและส่งออเดอร์/จัดการออเดอร์ไปยัง MT5 ผ่าน Remote Bridge:
+        - Engine A: Magic 123456 (Autonomous Scalp พร้อม SL/TP)
+        - Engine B: Magic 1212 (Recovery Engine ไม่มี SL บริหารแก้ไม้/เพิ่ม lot โดย LLM)
         """
         action = decision.get("action", "HOLD").upper()
         confidence = decision.get("confidence", 0.0)
         reasoning = decision.get("reasoning", "")
         model_used = decision.get("model_used", self.model)
         active_trade = ctx.get("active_trade") if ctx else None
+        recovery_basket = ctx.get("recovery_basket") if ctx else None
 
-        logging.info(f"📊 AI Decision: {action} (Conf: {confidence:.2f}) | Model: {model_used} | Regime: {decision.get('market_regime')}")
+        rec_act_log = f" | RecAction: {decision.get('recovery_action')} (Lot: {decision.get('recovery_lot')})" if decision.get("recovery_action") else ""
+        logging.info(f"📊 AI Decision: {action} (Conf: {confidence:.2f}){rec_act_log} | Model: {model_used} | Regime: {decision.get('market_regime')}")
         logging.info(f"💡 Rationale: {reasoning}")
 
-        # 1. HOLD หรือ HOLD_POSITION
-        if action in ["HOLD", "HOLD_POSITION"]:
-            if active_trade:
-                logging.info(f"⏸️ AI สั่ง HOLD_POSITION -> ถือออเดอร์ #{active_trade.get('ticket')} ต่อไปตามแผน (PnL: {active_trade.get('pnl_points')} pts)")
-            else:
-                logging.info("⏸️ Action เป็น HOLD -> สภาวะตลาดยังไม่ชัดเจน ไม่เปิดออเดอร์ใหม่")
+        # -------------------------------------------------------------
+        # STEP 1: จัดการคำสั่ง CLOSE_ALL หรือ CLOSE_POSITION
+        # -------------------------------------------------------------
+        if action == "CLOSE_ALL":
+            logging.info("🧹 ได้รับคำสั่ง CLOSE_ALL -> ปิดทุกออเดอร์ที่เปิดอยู่ทั้งหมด...")
+            all_pos = ctx.get("all_positions", []) if ctx else []
+            closed_count = 0
+            for p in all_pos:
+                p_ticket = p.get("ticket") or p.get("id")
+                if p_ticket:
+                    res = self.bridge.close_position(ticket=p_ticket, symbol=self.symbol)
+                    if res and res.get("status") == "SUCCESS":
+                        closed_count += 1
+            logging.info(f"✅ สั่งปิดเรียบร้อย {closed_count} ออเดอร์")
             return True
 
-        # 2. CLOSE_POSITION หรือ CLOSE_ALL
-        if action in ["CLOSE_POSITION", "CLOSE_ALL"]:
-            if action == "CLOSE_ALL":
-                logging.info("🧹 ได้รับคำสั่ง CLOSE_ALL -> ปิดทุกออเดอร์ที่เปิดอยู่ทั้งหมด...")
-                all_pos = ctx.get("all_positions", []) if ctx else []
-                closed_count = 0
-                for p in all_pos:
-                    p_ticket = p.get("ticket") or p.get("id")
-                    if p_ticket:
-                        res = self.bridge.close_position(ticket=p_ticket, symbol=self.symbol)
-                        if res and res.get("status") == "SUCCESS":
-                            closed_count += 1
-                logging.info(f"✅ สั่งปิดเรียบร้อย {closed_count} ออเดอร์")
-                return True
-            elif active_trade:
+        if action == "CLOSE_POSITION":
+            if active_trade:
                 t_id = active_trade.get("ticket")
                 logging.info(f"🧹 AI สั่งปิดออเดอร์ Magic 123456 (Ticket #{t_id}) เพื่อรักษากำไร/ตัดความเสี่ยง...")
                 if self.dry_run:
                     logging.info(f"🧪 [DRY RUN] จำลองปิดออเดอร์ #{t_id} สำเร็จ")
-                    return True
-                res = self.bridge.close_position(ticket=t_id, symbol=self.symbol)
-                if res and res.get("status") == "SUCCESS":
-                    logging.info(f"✅ ปิดออเดอร์ #{t_id} สำเร็จ!")
-                    return True
                 else:
-                    logging.error(f"❌ ปิดออเดอร์ล้มเหลว: {res}")
-                    return False
+                    res = self.bridge.close_position(ticket=t_id, symbol=self.symbol)
+                    if res and res.get("status") == "SUCCESS":
+                        logging.info(f"✅ ปิดออเดอร์ Magic 123456 #{t_id} สำเร็จ!")
+                    else:
+                        logging.error(f"❌ ปิดออเดอร์ Magic 123456 ล้มเหลว: {res}")
             else:
                 logging.info("ℹ️ ไม่มีออเดอร์ Magic 123456 เปิดอยู่ จึงไม่ต้องปิด")
-                return True
 
-        # 3. MODIFY_SLTP (ปรับ Trailing Stop หรือเลื่อนไป Breakeven สำหรับ Magic 123456)
+        # -------------------------------------------------------------
+        # STEP 2: จัดการคำสั่ง MODIFY_SLTP สำหรับ Magic 123456
+        # -------------------------------------------------------------
         if action == "MODIFY_SLTP":
             if not active_trade:
                 logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่มีออเดอร์ Magic 123456 เปิดอยู่")
-                return False
-
-            t_id = active_trade.get("ticket")
-            dir_pos = active_trade.get("direction")
-            cur_sl = active_trade.get("current_sl")
-            cur_tp = active_trade.get("current_tp")
-            new_sl = decision.get("new_sl")
-            new_tp = decision.get("new_tp") or cur_tp
-
-            if new_sl is None:
-                logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่ได้ระบุ new_sl")
-                return False
-
-            new_sl = round(float(new_sl), 2)
-            if new_tp is not None:
-                new_tp = round(float(new_tp), 2)
-
-            # Safety Guard: ห้ามขยาย Stop Loss (ขยับได้เฉพาะทางที่ลดความเสี่ยงเท่านั้น)
-            if cur_sl is not None and cur_sl > 0:
-                if dir_pos == "BUY" and new_sl < cur_sl:
-                    logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ BUY ({new_sl} < {cur_sl})")
-                    return False
-                elif dir_pos == "SELL" and new_sl > cur_sl:
-                    logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ SELL ({new_sl} > {cur_sl})")
-                    return False
-
-            logging.info(f"🛡️ [Magic 123456 LLM] ปรับ SL/TP ออเดอร์ #{t_id} -> SL ใหม่: {new_sl} (เดิม: {cur_sl}) | TP ใหม่: {new_tp}")
-            if self.dry_run:
-                logging.info(f"🧪 [DRY RUN] จำลองแก้ไข SL/TP สำเร็จ: #{t_id}")
-                return True
-
-            res = self.bridge.modify_position(ticket=t_id, new_sl=new_sl, new_tp=new_tp)
-            if res and res.get("status") == "SUCCESS":
-                logging.info(f"✅ แก้ไข SL/TP ออเดอร์ #{t_id} สำเร็จ!")
-                return True
             else:
-                logging.error(f"❌ แก้ไข SL/TP ล้มเหลว: {res}")
-                return False
+                t_id = active_trade.get("ticket")
+                dir_pos = active_trade.get("direction")
+                cur_sl = active_trade.get("current_sl")
+                cur_tp = active_trade.get("current_tp")
+                new_sl = decision.get("new_sl")
+                new_tp = decision.get("new_tp") or cur_tp
 
-        # 4. BUY หรือ SELL (เปิดคำสั่งพร้อมกันหลาย Magic Number ใน Multi-Order Matrix)
+                if new_sl is None:
+                    logging.warning("⚠️ AI สั่ง MODIFY_SLTP แต่ไม่ได้ระบุ new_sl")
+                else:
+                    new_sl = round(float(new_sl), 2)
+                    if new_tp is not None:
+                        new_tp = round(float(new_tp), 2)
+
+                    # Safety Guard: ห้ามขยาย Stop Loss (ขยับได้เฉพาะทางที่ลดความเสี่ยงเท่านั้น)
+                    blocked = False
+                    if cur_sl is not None and cur_sl > 0:
+                        if dir_pos == "BUY" and new_sl < cur_sl:
+                            logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ BUY ({new_sl} < {cur_sl})")
+                            blocked = True
+                        elif dir_pos == "SELL" and new_sl > cur_sl:
+                            logging.warning(f"🛡️ Guard Blocked: ห้ามเลื่อน SL กว้างขึ้นสำหรับ SELL ({new_sl} > {cur_sl})")
+                            blocked = True
+
+                    if not blocked:
+                        logging.info(f"🛡️ [Magic 123456 LLM] ปรับ SL/TP ออเดอร์ #{t_id} -> SL ใหม่: {new_sl} (เดิม: {cur_sl}) | TP ใหม่: {new_tp}")
+                        if self.dry_run:
+                            logging.info(f"🧪 [DRY RUN] จำลองแก้ไข SL/TP สำเร็จ: #{t_id}")
+                        else:
+                            res = self.bridge.modify_position(ticket=t_id, new_sl=new_sl, new_tp=new_tp)
+                            if res and res.get("status") == "SUCCESS":
+                                logging.info(f"✅ แก้ไข SL/TP ออเดอร์ #{t_id} สำเร็จ!")
+                            else:
+                                logging.error(f"❌ แก้ไข SL/TP ล้มเหลว: {res}")
+
+        # -------------------------------------------------------------
+        # STEP 3: เปิดออเดอร์เริ่มต้นคู่ (Dual Entry: Magic 123456 + Magic 1212)
+        # -------------------------------------------------------------
         if action in ["BUY", "SELL"]:
-            if active_trade:
-                logging.info(f"⚠️ มีออเดอร์ Magic 123456 (#{active_trade.get('ticket')}) เปิดอยู่แล้ว -> ข้ามการเปิดใหม่เพื่อคุมความเสี่ยง")
-                return False
-
-            price_info = self.bridge.get_current_price(symbol=self.symbol)
-            if not price_info:
-                logging.error("❌ ไม่สามารถดึงราคา Realtime เพื่อเปิดออเดอร์ได้")
-                return False
-
-            spread_points = price_info.get("spread", 0.0)
-            bid = price_info.get("bid", 0.0)
-            ask = price_info.get("ask", 0.0)
-
-            if spread_points > self.max_spread_points:
-                logging.warning(f"⚠️ Spread สูงเกินเกณฑ์ ({spread_points} > {self.max_spread_points}) -> ข้ามรอบนี้")
-                return False
-
-            sl_points = max(self.min_sl_tp_points, min(self.max_sl_tp_points, int(decision.get("sl_points") or 200)))
-            tp_points = max(self.min_sl_tp_points, min(self.max_sl_tp_points, int(decision.get("tp_points") or 300)))
-            point_value = 0.01
-
-            if action == "BUY":
-                entry_price = ask
-                sl_price = round(entry_price - (sl_points * point_value), 2)
-                tp_price = round(entry_price + (tp_points * point_value), 2)
+            if active_trade or recovery_basket:
+                logging.info(f"⚠️ มีออเดอร์ในระบบเปิดอยู่แล้ว (123456: {bool(active_trade)}, 1212: {bool(recovery_basket)}) -> ข้ามการเปิดใหม่เพื่อคุมความเสี่ยง")
             else:
-                entry_price = bid
-                sl_price = round(entry_price + (sl_points * point_value), 2)
-                tp_price = round(entry_price - (tp_points * point_value), 2)
+                price_info = self.bridge.get_current_price(symbol=self.symbol)
+                if not price_info:
+                    logging.error("❌ ไม่สามารถดึงราคา Realtime เพื่อเปิดออเดอร์ได้")
+                    return False
 
-            logging.info(f"🛡️ Safety Guard Checked: {action} @ {entry_price} | SL: {sl_price} ({sl_points} pts) | TP: {tp_price} ({tp_points} pts)")
+                spread_points = price_info.get("spread", 0.0)
+                bid = price_info.get("bid", 0.0)
+                ask = price_info.get("ask", 0.0)
 
-            comment = f"Scalp-{action[:1]}-{sl_points}/{tp_points}"[:27]
+                if spread_points > self.max_spread_points:
+                    logging.warning(f"⚠️ Spread สูงเกินเกณฑ์ ({spread_points} > {self.max_spread_points}) -> ข้ามรอบนี้")
+                    return False
 
-            if self.dry_run:
-                logging.info(f"🧪 [DRY RUN] จำลองส่งออเดอร์สำเร็จ: {action} {self.lot_size} lot @ {entry_price} | SL: {sl_price} | TP: {tp_price}")
-                return True
+                sl_points = max(self.min_sl_tp_points, min(self.max_sl_tp_points, int(decision.get("sl_points") or 200)))
+                tp_points = max(self.min_sl_tp_points, min(self.max_sl_tp_points, int(decision.get("tp_points") or 300)))
+                point_value = 0.01
 
-            if hasattr(self.bridge, "send_order"):
-                result = self.bridge.send_order(
+                if action == "BUY":
+                    entry_price = ask
+                    sl_price = round(entry_price - (sl_points * point_value), 2)
+                    tp_price = round(entry_price + (tp_points * point_value), 2)
+                else:
+                    entry_price = bid
+                    sl_price = round(entry_price + (sl_points * point_value), 2)
+                    tp_price = round(entry_price - (tp_points * point_value), 2)
+
+                logging.info(f"🛡️ Safety Guard Checked: {action} @ {entry_price} | SL: {sl_price} ({sl_points} pts) | TP: {tp_price} ({tp_points} pts)")
+
+                comment_123456 = f"Scalp-{action[:1]}-{sl_points}/{tp_points}"[:27]
+                comment_1212 = f"Rec-{action[:1]}-L1-0/{tp_points}"[:27]
+
+                if self.dry_run:
+                    logging.info(f"🧪 [DRY RUN] จำลองส่งออเดอร์คู่: Magic 123456 (SL: {sl_price}) + Magic 1212 (NO SL | TP: {tp_price})")
+                    return True
+
+                # ส่งคำสั่งไม้ 1: Magic 123456 (Scalp ปกติ มี SL)
+                res_123456 = self.bridge.send_order(
                     action=action,
                     symbol=self.symbol,
                     volume=self.lot_size,
                     sl=sl_price,
                     tp=tp_price,
                     magic=123456,
-                    comment=comment
+                    comment=comment_123456
                 )
-            else:
-                result = self.bridge.open_position(
-                    direction=action,
-                    lot=self.lot_size,
-                    sl=sl_price,
-                    tp=tp_price,
+
+                # ส่งคำสั่งไม้ 2: Magic 1212 (Duplicate ไม้ 123456 แต่ไม่มี SL - แก้ไม้โดย LLM)
+                res_1212 = self.bridge.send_order(
+                    action=action,
                     symbol=self.symbol,
-                    magic=123456,
-                    comment=comment
+                    volume=self.lot_size,
+                    sl=None,
+                    tp=tp_price,
+                    magic=1212,
+                    comment=comment_1212
                 )
 
-            if result and result.get("status") == "SUCCESS":
-                logging.info(f"✅ เปิดออเดอร์สำเร็จ! Ticket: {result.get('ticket')} (Magic: 123456)")
+                t1 = res_123456.get("ticket") if res_123456 else "FAILED"
+                t2 = res_1212.get("ticket") if res_1212 else "FAILED"
+                logging.info(f"🎯 [Dual Entry Success] Magic 123456 Ticket #{t1} (SL={sl_price}) | Magic 1212 Ticket #{t2} (NO SL | TP={tp_price})")
                 return True
-            else:
-                logging.error(f"❌ ยิงออเดอร์ล้มเหลว: {result}")
-                return False
 
-        logging.warning(f"⚠️ ไม่รู้จักคำสั่ง Action: {action}")
-        return False
+        if action in ["HOLD", "HOLD_POSITION"]:
+            if active_trade:
+                logging.info(f"⏸️ AI สั่ง HOLD_POSITION -> ถือออเดอร์ Magic 123456 #{active_trade.get('ticket')} (PnL: {active_trade.get('pnl_points')} pts)")
+            else:
+                logging.info("⏸️ Action เป็น HOLD สำหรับ Magic 123456")
+
+        # -------------------------------------------------------------
+        # STEP 4: ระบบประเมินและบริหารแก้ไม้สำหรับ Magic 1212 (Recovery Engine)
+        # -------------------------------------------------------------
+        rec_action = str(decision.get("recovery_action", "NONE")).upper()
+
+        if rec_action == "CLOSE_RECOVERY_BASKET":
+            if recovery_basket:
+                layers = recovery_basket.get("layers", [])
+                logging.info(f"🧹 AI สั่ง CLOSE_RECOVERY_BASKET -> กำลังปิดรวบออเดอร์ Magic 1212 ทั้งหมด {len(layers)} ไม้ (Net PnL: {recovery_basket.get('basket_pnl_points')} pts)...")
+                closed_count = 0
+                for lyr in layers:
+                    t_id = lyr.get("ticket")
+                    if t_id:
+                        if self.dry_run:
+                            logging.info(f"🧪 [DRY RUN] จำลองปิดไม้แก้ Magic 1212 Ticket #{t_id}")
+                            closed_count += 1
+                        else:
+                            res = self.bridge.close_position(ticket=t_id, symbol=self.symbol)
+                            if res and res.get("status") == "SUCCESS":
+                                closed_count += 1
+                logging.info(f"✅ ปิดรวบออเดอร์ Magic 1212 สำเร็จ: {closed_count}/{len(layers)} ไม้")
+            else:
+                logging.info("ℹ️ ไม่มีออเดอร์ Magic 1212 ค้างอยู่ จึงไม่ต้องปิด")
+
+        elif rec_action == "ADD_RECOVERY_LAYER":
+            if not recovery_basket:
+                logging.warning("⚠️ AI สั่ง ADD_RECOVERY_LAYER แต่ไม่มีตะกร้าไม้ Magic 1212 เปิดอยู่")
+            else:
+                layers = recovery_basket.get("layers", [])
+                curr_layers = len(layers)
+                if curr_layers >= self.max_recovery_layers:
+                    logging.warning(f"🛡️ Safety Guard Blocked: ตะกร้า Magic 1212 มีไม้แก้เต็มโควตาแล้ว ({curr_layers}/{self.max_recovery_layers}) ห้ามเปิดเพิ่ม")
+                else:
+                    last_layer_entry = layers[-1]["entry_price"]
+                    price_info = self.bridge.get_current_price(symbol=self.symbol)
+                    bid = price_info.get("bid", 0.0) if price_info else 0.0
+                    ask = price_info.get("ask", 0.0) if price_info else 0.0
+                    basket_dir = recovery_basket.get("direction", "BUY").upper()
+                    exec_price = ask if basket_dir == "BUY" else bid
+
+                    dist_points = abs(exec_price - last_layer_entry) / 0.01
+                    if dist_points < self.min_recovery_distance_points:
+                        logging.warning(f"🛡️ Safety Guard Blocked: ราคาห่างจากไม้แก้ล่าสุดไม่ถึงเกณฑ์ ({dist_points:.1f} pts < {self.min_recovery_distance_points} pts) -> ชะลอการเปิดไม้แก้")
+                    else:
+                        rec_lot_req = decision.get("recovery_lot")
+                        try:
+                            rec_lot_val = float(rec_lot_req) if rec_lot_req is not None else self.lot_size
+                        except Exception:
+                            rec_lot_val = self.lot_size
+                        
+                        final_rec_lot = round(max(self.lot_size, min(self.max_recovery_lot, rec_lot_val)), 2)
+                        next_layer_num = curr_layers + 1
+                        comment = f"Rec-{basket_dir[:1]}-L{next_layer_num}-{final_rec_lot}"[:27]
+                        basket_tp = layers[0].get("current_tp")
+
+                        logging.info(f"💡 [LLM Recovery Execution] เปิดไม้แก้ Layer {next_layer_num}: {basket_dir} {final_rec_lot} lot @ {exec_price} (NO SL | TP: {basket_tp})")
+                        if self.dry_run:
+                            logging.info(f"🧪 [DRY RUN] จำลองเปิดไม้แก้สำเร็จ: Layer {next_layer_num} ({final_rec_lot} lot)")
+                        else:
+                            res = self.bridge.send_order(
+                                action=basket_dir,
+                                symbol=self.symbol,
+                                volume=final_rec_lot,
+                                sl=None,
+                                tp=basket_tp,
+                                magic=1212,
+                                comment=comment
+                            )
+                            if res and res.get("status") == "SUCCESS":
+                                logging.info(f"✅ เปิดไม้แก้ Magic 1212 Layer {next_layer_num} สำเร็จ! Ticket #{res.get('ticket')}")
+                            else:
+                                logging.error(f"❌ เปิดไม้แก้ Magic 1212 ล้มเหลว: {res}")
+
+        elif rec_action == "HOLD":
+            if recovery_basket:
+                logging.info(f"⏸️ AI สั่ง HOLD ไม้แก้ Magic 1212 ({recovery_basket.get('layers_count')} layers, PnL: {recovery_basket.get('basket_pnl_points')} pts) -> รอโครงสร้างราคาคลี่คลาย")
+
+        return True
 
     def run_single_cycle(self) -> bool:
         """
@@ -605,7 +754,9 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
             return False
 
         trade_status_str = f"In Trade #{ctx['active_trade']['ticket']} ({ctx['active_trade']['direction']} {ctx['active_trade']['pnl_points']} pts)" if ctx.get("active_trade") else "FLAT"
-        logging.info(f"📈 วิเคราะห์แท่งเทียนที่เพิ่งปิด: {ctx['candle_time']} | ราคาปิด: {ctx['current_price']:.2f} | สถานะ: {trade_status_str}")
+        rec_status_str = f"Basket {ctx['recovery_basket']['direction']} ({ctx['recovery_basket']['layers_count']}L, {ctx['recovery_basket']['total_lot']} lot, avg: {ctx['recovery_basket']['avg_entry']}, PnL: {ctx['recovery_basket']['basket_pnl_points']} pts)" if ctx.get("recovery_basket") else "FLAT"
+        logging.info(f"📈 วิเคราะห์แท่ง M5 ปิด: {ctx['candle_time']} | ราคาปิด: {ctx['current_price']:.2f}")
+        logging.info(f"💼 สถานะพอร์ต: [Magic 123456: {trade_status_str}] | [Magic 1212: {rec_status_str}]")
         logging.info(f"📊 100-Bar Macro: [{ctx['min_100']:.2f} - {ctx['max_100']:.2f}] (Range: {ctx['range_100']:.2f})")
 
         decision = self.call_ai_decision(ctx)
@@ -621,7 +772,7 @@ Analyze the market structure, evaluate trade health (if in position) or setup co
         รันระบบอัตโนมัติต่อเนื่อง 24/7 โดยซิงค์ตามเวลาเครื่องโทรศัพท์ทุก 5 นาทีเป๊ะ
         เช่น 01:00, 01:05, 01:10, 01:15, ... (+ 1 วินาที buffer ให้แท่งปิดสมบูรณ์)
         """
-        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (ซิงค์เวลาโทรศัพท์ทุก 5 นาที | Magic: 123456)")
+        logging.info("🎯 เข้าสู่โหมดรันอัตโนมัติ 24/7 (ซิงค์เวลาโทรศัพท์ทุก 5 นาที | Dual-Engine: 123456 + 1212)")
         
         if run_immediately:
             logging.info("⚡ รันรอบแรกทันทีเมื่อสตาร์ท...")

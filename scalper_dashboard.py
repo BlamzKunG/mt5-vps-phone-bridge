@@ -326,6 +326,7 @@ class ScalperCLIDashboard:
 
             policy_names = {
                 123456: "LLM Auto",
+                1212: "LLM Recovery (No SL)",
                 2222: "BE 50% TP",
                 3333: "Fast Trail",
                 4444: "1.5x ATR",
@@ -358,6 +359,7 @@ class ScalperCLIDashboard:
             bp_table.add_column("Policy", justify="left", style="bold white")
             bp_table.add_column("Management Strategy", justify="left", style="dim")
             bp_table.add_row("123456", "LLM Autonomous", "AI manages trade autonomously (tighten SL / exit)")
+            bp_table.add_row("1212", "LLM Recovery", "Duplicate entry with No SL, LLM assesses recovery & lot scaling")
             bp_table.add_row("2222", "50% TP Breakeven", "Move SL to BE (+20 pts) when profit >= 50% TP")
             bp_table.add_row("3333", "Fast Step Trail", "Step trail: starts at 100 pts, trails 50 pt steps")
             bp_table.add_row("4444", "1.5x ATR Trailing", "Trail SL at 1.5x ATR(14) behind live price")
