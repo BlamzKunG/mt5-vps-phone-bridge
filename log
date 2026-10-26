@@ -1,0 +1,299 @@
+m404 Not Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     100.27.18.199:26890 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     103.203.57.20:34854 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     18.116.101.220:39308 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.172.197:36606 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     66.132.172.197:36648 - "←[1mPRI %2A HTTP/2.0←[0m" ←[31m404 No
+t Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+2026-10-25 12:00:06,500 [ERROR] Exception in callback _ProactorReadPipeTransport
+._data_received(bytearray(b'\...00\x00\x00\n'), 33)
+handle: <Handle _ProactorReadPipeTransport._data_received(bytearray(b'\...00\x00
+\x00\n'), 33)>
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\proactor_events.py", line 274, in _data_received
+    self._protocol.data_received(data)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 176, in data_received
+    self.handle_events()
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 185, in handle_events
+    self.send_400_response(msg)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 306, in send_400_response
+    output = self.conn.send(event)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 538, in send
+    data_list = self.send_with_data_passthrough(event)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 563, in send_with_data_passthrough
+    self._process_event(self.our_role, event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 284, in _process_event
+    self._cstate.process_event(role, type(event), server_switch_event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 291, in process_event
+    self._fire_event_triggered_transitions(role, _event_type)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 309, in _fire_event_triggered_transitions
+    raise LocalProtocolError(
+h11._util.LocalProtocolError: can't handle event type Response when role=SERVER
+and state=MUST_CLOSE
+←[32mINFO←[0m:     66.132.172.197:49106 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[
+31m404 Not Found←[0m
+←[32mINFO←[0m:     66.132.172.197:29406 - "←[1mPOST /mcp HTTP/1.1←[0m" ←[31m404
+Not Found←[0m
+←[32mINFO←[0m:     66.132.172.197:29428 - "←[1mPOST /jsonrpc HTTP/1.1←[0m" ←[31m
+404 Not Found←[0m
+←[32mINFO←[0m:     66.132.172.197:54330 - "←[1mPOST / HTTP/1.1←[0m" ←[31m405 Met
+hod Not Allowed←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.172.197:16068 - "←[1mGET /robots.txt HTTP/1.1←[0m" ←[3
+1m404 Not Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.172.141:24876 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     66.132.172.141:24878 - "←[1mPRI %2A HTTP/2.0←[0m" ←[31m404 No
+t Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+2026-10-25 12:14:40,444 [ERROR] Exception in callback _ProactorReadPipeTransport
+._data_received(bytearray(b'\...00\x00\x00\n'), 33)
+handle: <Handle _ProactorReadPipeTransport._data_received(bytearray(b'\...00\x00
+\x00\n'), 33)>
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\proactor_events.py", line 274, in _data_received
+    self._protocol.data_received(data)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 176, in data_received
+    self.handle_events()
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 185, in handle_events
+    self.send_400_response(msg)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 306, in send_400_response
+    output = self.conn.send(event)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 538, in send
+    data_list = self.send_with_data_passthrough(event)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 563, in send_with_data_passthrough
+    self._process_event(self.our_role, event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 284, in _process_event
+    self._cstate.process_event(role, type(event), server_switch_event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 291, in process_event
+    self._fire_event_triggered_transitions(role, _event_type)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 309, in _fire_event_triggered_transitions
+    raise LocalProtocolError(
+h11._util.LocalProtocolError: can't handle event type Response when role=SERVER
+and state=MUST_CLOSE
+←[32mINFO←[0m:     66.132.172.141:15618 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[
+31m404 Not Found←[0m
+←[32mINFO←[0m:     66.132.172.141:41984 - "←[1mPOST /mcp HTTP/1.1←[0m" ←[31m404
+Not Found←[0m
+←[32mINFO←[0m:     66.132.172.141:42004 - "←[1mPOST /jsonrpc HTTP/1.1←[0m" ←[31m
+404 Not Found←[0m
+←[32mINFO←[0m:     66.132.172.141:42012 - "←[1mPOST / HTTP/1.1←[0m" ←[31m405 Met
+hod Not Allowed←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.172.141:50048 - "←[1mGET /sellers.json HTTP/1.1←[0m" ←
+[31m404 Not Found←[0m
+←[32mINFO←[0m:     199.165.159.177:10384 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←
+[0m
+←[32mINFO←[0m:     199.165.159.183:40945 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←
+[31m404 Not Found←[0m
+←[32mINFO←[0m:     199.165.159.180:17217 - "←[1mGET http%3A//api.ipify.org/?form
+at=json HTTP/1.1←[0m" ←[31m404 Not Found←[0m
+←[32mINFO←[0m:     199.165.159.180:34827 - "←[1mCONNECT www.shadowserver.org%3A4
+43 HTTP/1.1←[0m" ←[31m404 Not Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     94.231.206.135:40409 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     94.231.206.159:43081 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[
+31m404 Not Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     85.217.140.36:50044 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     34.140.120.55:33710 - "←[1mCONNECT api.ipify.org%3A443 HTTP/1
+.1←[0m" ←[31m404 Not Found←[0m
+←[32mINFO←[0m:     167.104.160.76:58270 - "←[1mGET /v1/models HTTP/1.1←[0m" ←[31
+m404 Not Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     207.175.100.167:29648 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←
+[0m
+←[32mINFO←[0m:     35.241.191.162:36966 - "←[1mOPTIONS / HTTP/1.1←[0m" ←[31m405
+Method Not Allowed←[0m
+←[32mINFO←[0m:     35.241.191.162:36958 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     35.241.191.162:36990 - "←[1mNRQN / HTTP/1.1←[0m" ←[31m405 Met
+hod Not Allowed←[0m
+←[32mINFO←[0m:     35.241.191.162:36974 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[
+31m404 Not Found←[0m
+←[32mINFO←[0m:     35.241.191.162:36998 - "←[1mGET /pub/ HTTP/1.1←[0m" ←[31m404
+Not Found←[0m
+←[32mINFO←[0m:     35.241.191.162:37010 - "←[1mHEAD / HTTP/1.1←[0m" ←[31m405 Met
+hod Not Allowed←[0m
+←[32mINFO←[0m:     35.241.191.162:37016 - "←[1mPOST / HTTP/1.1←[0m" ←[31m405 Met
+hod Not Allowed←[0m
+←[32mINFO←[0m:     35.241.191.162:37026 - "←[1mGET /files/ HTTP/1.1←[0m" ←[31m40
+4 Not Found←[0m
+←[32mINFO←[0m:     35.241.191.162:37032 - "←[1mOPTIONS / HTTP/1.1←[0m" ←[31m405
+Method Not Allowed←[0m
+←[32mINFO←[0m:     35.241.191.162:37046 - "←[1mGET /downloads/ HTTP/1.1←[0m" ←[3
+1m404 Not Found←[0m
+←[32mINFO←[0m:     35.195.42.59:40980 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0m
+
+←[32mINFO←[0m:     109.105.209.2:48592 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     109.105.209.2:39154 - "←[1mPOST /mcp HTTP/1.1←[0m" ←[31m404 N
+ot Found←[0m
+←[32mINFO←[0m:     109.105.209.2:39154 - "←[1mGET /sse HTTP/1.1←[0m" ←[31m404 No
+t Found←[0m
+←[32mINFO←[0m:     109.105.209.4:58456 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[3
+1m404 Not Found←[0m
+←[32mINFO←[0m:     162.243.167.117:55810 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←
+[0m
+←[32mINFO←[0m:     162.243.167.117:55816 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←
+[31m404 Not Found←[0m
+←[32mINFO←[0m:     20.98.154.233:52628 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     94.183.174.100:43242 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     205.210.31.214:61710 - "←[1mGET /.well-known/security.txt HTT
+P/1.1←[0m" ←[31m404 Not Found←[0m
+←[32mINFO←[0m:     198.235.24.237:64194 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.186.166:32568 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[
+0m
+←[32mINFO←[0m:     66.132.186.166:55220 - "←[1mPRI %2A HTTP/2.0←[0m" ←[31m404 No
+t Found←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[33mWARNING←[0m:  Invalid HTTP request received.
+2026-10-26 03:18:39,452 [ERROR] Exception in callback _ProactorReadPipeTransport
+._data_received(bytearray(b'\...00\x00\x00\n'), 33)
+handle: <Handle _ProactorReadPipeTransport._data_received(bytearray(b'\...00\x00
+\x00\n'), 33)>
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\async
+io\proactor_events.py", line 274, in _data_received
+    self._protocol.data_received(data)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 176, in data_received
+    self.handle_events()
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 185, in handle_events
+    self.send_400_response(msg)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\uvicorn\protocols\http\h11_impl.py", line 306, in send_400_response
+    output = self.conn.send(event)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 538, in send
+    data_list = self.send_with_data_passthrough(event)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 563, in send_with_data_passthrough
+    self._process_event(self.our_role, event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_connection.py", line 284, in _process_event
+    self._cstate.process_event(role, type(event), server_switch_event)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 291, in process_event
+    self._fire_event_triggered_transitions(role, _event_type)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\Lib\site-
+packages\h11\_state.py", line 309, in _fire_event_triggered_transitions
+    raise LocalProtocolError(
+h11._util.LocalProtocolError: can't handle event type Response when role=SERVER
+and state=MUST_CLOSE
+←[32mINFO←[0m:     66.132.186.166:55236 - "←[1mGET /favicon.ico HTTP/1.1←[0m" ←[
+31m404 Not Found←[0m
+←[32mINFO←[0m:     66.132.186.166:29284 - "←[1mPOST /mcp HTTP/1.1←[0m" ←[31m404
+Not Found←[0m
+←[32mINFO←[0m:     66.132.186.166:8488 - "←[1mPOST /jsonrpc HTTP/1.1←[0m" ←[31m4
+04 Not Found←[0m
+←[32mINFO←[0m:     66.132.186.166:8514 - "←[1mPOST / HTTP/1.1←[0m" ←[31m405 Meth
+od Not Allowed←[0m
+←[33mWARNING←[0m:  Invalid HTTP request received.
+←[32mINFO←[0m:     66.132.186.166:19912 - "←[1mGET /ads.txt HTTP/1.1←[0m" ←[31m4
+04 Not Found←[0m
+←[32mINFO←[0m:     205.210.31.144:59696 - "←[1mGET /metrics HTTP/1.1←[0m" ←[31m4
+04 Not Found←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/ohlc?symbol=XAUUSD&timef
+rame=5m&count=105 HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/positions?symbol=XAUUSD
+HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54341 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54341 - "←[1mGET /api/ohlc?symbol=XAUUSD&timef
+rame=5m&count=105 HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54341 - "←[1mGET /api/positions?symbol=XAUUSD
+HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/ohlc?symbol=XAUUSD&timef
+rame=5m&count=105 HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54337 - "←[1mGET /api/positions?symbol=XAUUSD
+HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     185.247.137.9:46717 - "←[1mGET / HTTP/1.1←[0m" ←[32m200 OK←[0
+m
+←[32mINFO←[0m:     75.127.6.2:47868 - "←[1mGET http%3A//azenv.net/ HTTP/1.1←[0m"
+ ←[31m404 Not Found←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/ohlc?symbol=XAUUSD&timef
+rame=5m&count=105 HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/positions?symbol=XAUUSD
+HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+2026-10-26 06:07:25,576 [INFO] ?? ???????????????? MT5: SELL 0.01 lot ?? XAUUSD-
+ECN (Price=3995.78, SL=3999.79, TP=3990.79)
+2026-10-26 06:07:25,888 [INFO] ?? ???????????????! Ticket ID: 859451913
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mPOST /api/order HTTP/1.1←[0m" ←[3
+2m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/ohlc?symbol=XAUUSD&timef
+rame=5m&count=105 HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54345 - "←[1mGET /api/positions?symbol=XAUUSD
+HTTP/1.1←[0m" ←[32m200 OK←[0m
+←[32mINFO←[0m:     182.232.234.60:54360 - "←[1mGET /api/price?symbol=XAUUSD HTTP
+/1.1←[0m" ←[32m200 OK←[0m
+2026-10-26 06:57:26,702 [INFO] ?? ???????????????? MT5: SELL 0.01 lot ?? XAUUSD-
+ECN (Price=3997.18, SL=4000.08, TP=3992.88)
+2026-10-26 06:57:26,967 [INFO] ?? ???????????????! Ticket ID: 859588303
+←[32mINFO←[0m:     182.232.234.60:54360 - "←[1mPOST /api/order HTTP/1.1←[0m" ←[3
+2m200 OK←[0m
