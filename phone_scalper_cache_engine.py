@@ -59,9 +59,9 @@ class PriceActionScalperCacheEngine:
         max_spread_points: float = 40.0,
         min_sl_tp_points: int = 100,
         max_sl_tp_points: int = 500,
-        max_recovery_layers: int = 3,
-        max_recovery_lot: float = 0.05,
-        min_recovery_distance_points: float = 80.0,
+        max_recovery_layers: Optional[int] = None,
+        max_recovery_lot: Optional[float] = None,
+        min_recovery_distance_points: Optional[float] = None,
         dry_run: bool = False
     ):
         self.vps_url = vps_url or os.getenv("VPS_URL", "http://154.197.116.121:8000")
@@ -76,9 +76,9 @@ class PriceActionScalperCacheEngine:
         self.max_spread_points = max_spread_points
         self.min_sl_tp_points = min_sl_tp_points
         self.max_sl_tp_points = max_sl_tp_points
-        self.max_recovery_layers = max_recovery_layers
-        self.max_recovery_lot = max_recovery_lot
-        self.min_recovery_distance_points = min_recovery_distance_points
+        self.max_recovery_layers = max_recovery_layers if max_recovery_layers is not None else int(os.getenv("MAX_RECOVERY_LAYERS", "20"))
+        self.max_recovery_lot = max_recovery_lot if max_recovery_lot is not None else float(os.getenv("MAX_RECOVERY_LOT", "0.05"))
+        self.min_recovery_distance_points = min_recovery_distance_points if min_recovery_distance_points is not None else float(os.getenv("MIN_RECOVERY_GAP", "80.0"))
         self.dry_run = dry_run
 
         self.last_processed_candle_time: Optional[str] = None
@@ -341,10 +341,12 @@ You manage two parallel execution engines on the same account:
 1. Engine A (Magic 123456 - Autonomous Scalper):
    - Strict risk control with hard Stop Loss (100 to 500 points) and Take Profit (100 to 500 points).
    - If in trade, managed via "HOLD_POSITION", "MODIFY_SLTP" (tighten SL / Breakeven), or "CLOSE_POSITION".
-2. Engine B (Magic 1212 - Dynamic Recovery / "ระบบแก้ไม้"):
+2. Engine B (Magic 1212 - Dynamic Full Recovery / "ระบบแก้ไม้เต็มรูปแบบ - ห้ามคัทลอส"):
    - Opened simultaneously with Engine A upon entry, but has NO Hard Stop Loss (sl = 0).
-   - If price moves against the trade (even if Engine A gets stopped out), Engine B remains alive.
-   - At each closed M5 bar, evaluate whether the market structure justifies opening a recovery order ("เปิดไม้แก้") and whether to increase lot size ("เพิ่ม lot").
+   - NEVER CUT LOSS AT A DRAWDOWN. Even if Engine A gets stopped out, Engine B remains alive and in play.
+   - Magic 1212 is a dedicated recovery basket capable of holding up to 20 recovery layers (Layer 1 to 20).
+   - At each closed M5 bar, evaluate whether the market structure justifies opening a recovery order ("เปิดไม้แก้") and whether to increase lot size ("เพิ่ม lot" up to 0.05).
+   - STRICT MANDATE: NEVER surrender or close Magic 1212 at a loss! Your mission is to guide the basket until it turns profitable.
 
 CORE METHODOLOGY:
 1. Macro Context (100-bar Normalized Curve [0.00 to 1.00]):
@@ -371,12 +373,13 @@ B. When Magic 123456 is IN POSITION:
      * Rule: ONLY tighten SL (lower risk). NEVER widen SL.
    - "CLOSE_POSITION": Early emergency exit for 123456 upon adverse liquidity sweep / opposing CHoCH.
 
-C. When Magic 1212 Recovery Basket is ACTIVE (Evaluate "แก้ไม้"):
+C. When Magic 1212 Recovery Basket is ACTIVE (Evaluate "แก้ไม้เต็มรูปแบบ - ห้ามคัทลอส"):
    - "NONE": When no 1212 basket exists.
-   - "HOLD": 1212 basket is running; wait patiently. Do NOT add a layer if adverse momentum is still explosive without a structural reversal trigger.
+   - "HOLD": 1212 basket is running and in negative drawdown; wait patiently. Do NOT add a layer if adverse momentum is still explosive without structural exhaustion. NEVER close 1212 at a loss!
    - "ADD_RECOVERY_LAYER": High-confluence reversal zone reached (e.g. key liquidity sweep, opposing order block, rejection pin bar).
-     * recovery_lot: Evaluate whether to keep same lot (0.01) or increase lot (0.02 to 0.03, max 0.05) to pull the basket break-even price closer.
-   - "CLOSE_RECOVERY_BASKET": Emergency cut or basket profit take. If macro structure has completely broken down and holding is existential risk, or basket is already in target profit.
+     * System supports up to 20 recovery layers (Layer 1 to 20).
+     * recovery_lot: Evaluate whether to keep same lot (0.01) or increase lot (0.02 to 0.05) to pull the basket break-even price closer.
+   - "CLOSE_RECOVERY_BASKET": PROFIT TAKE ONLY! Only permitted if basket_pnl_points > 0 (net profit) and you want to lock in basket profit early. STRICTLY FORBIDDEN to use when basket is at a loss!
 
 OUTPUT FORMAT REQUIREMENTS:
 Return PURE JSON ONLY (no markdown code blocks, no backticks, no conversational filler):
@@ -390,7 +393,7 @@ Return PURE JSON ONLY (no markdown code blocks, no backticks, no conversational 
   "recovery_action": "NONE" | "HOLD" | "ADD_RECOVERY_LAYER" | "CLOSE_RECOVERY_BASKET",
   "recovery_lot": <float 0.01 to 0.05 or null>,
   "market_regime": "<concise regime description>",
-  "reasoning": "<structured quantitative rationale: 1) 100-bar macro, 2) 20-bar candle action, 3) 123456 scalp management, 4) 1212 recovery evaluation and lot sizing>"
+  "reasoning": "<structured quantitative rationale: 1) 100-bar macro, 2) 20-bar candle action, 3) 123456 scalp management, 4) 1212 recovery evaluation (up to 20 layers, zero cut-loss policy) and lot sizing>"
 }"""
 
         active_trade_str = json.dumps(ctx.get("active_trade"), indent=1) if ctx.get("active_trade") else "FLAT (No Open Positions)"
@@ -669,20 +672,28 @@ Synthesize the immutable methodology, historical structure, and the newly closed
 
         if rec_action == "CLOSE_RECOVERY_BASKET":
             if recovery_basket:
-                layers = recovery_basket.get("layers", [])
-                logging.info(f"🧹 AI สั่ง CLOSE_RECOVERY_BASKET -> กำลังปิดรวบออเดอร์ Magic 1212 ทั้งหมด {len(layers)} ไม้ (Net PnL: {recovery_basket.get('basket_pnl_points')} pts)...")
-                closed_count = 0
-                for lyr in layers:
-                    t_id = lyr.get("ticket")
-                    if t_id:
-                        if self.dry_run:
-                            logging.info(f"🧪 [DRY RUN] จำลองปิดไม้แก้ Magic 1212 Ticket #{t_id}")
-                            closed_count += 1
-                        else:
-                            res = self.bridge.close_position(ticket=t_id, symbol=self.symbol)
-                            if res and res.get("status") == "SUCCESS":
+                basket_pnl_pts = float(recovery_basket.get("basket_pnl_points", 0.0))
+                # 🛡️ HARD SAFETY GUARD: Magic 1212 คือระบบแก้ไม้เต็มรูปแบบ ห้ามคัทลอสตอนติดลบเด็ดขาด!
+                if basket_pnl_pts <= 0:
+                    logging.warning(
+                        f"🛡️ Safety Guard Blocked: AI สั่ง CLOSE_RECOVERY_BASKET แต่ตระกร้า Magic 1212 ยังติดลบ ({basket_pnl_pts} pts) "
+                        f"-> ระบบแก้ไม้เต็มรูปแบบไม่อนุญาตให้คัทลอส! บังคับ HOLD เพื่อรอจังหวะแก้ไม้ทำกำไร"
+                    )
+                else:
+                    layers = recovery_basket.get("layers", [])
+                    logging.info(f"💰 AI สั่ง CLOSE_RECOVERY_BASKET เพื่อเก็บกำไรรวม {basket_pnl_pts} pts -> กำลังปิดรวบ Magic 1212 ทั้งหมด {len(layers)} ไม้...")
+                    closed_count = 0
+                    for lyr in layers:
+                        t_id = lyr.get("ticket")
+                        if t_id:
+                            if self.dry_run:
+                                logging.info(f"🧪 [DRY RUN] จำลองปิดไม้แก้ Magic 1212 Ticket #{t_id}")
                                 closed_count += 1
-                logging.info(f"✅ ปิดรวบออเดอร์ Magic 1212 สำเร็จ: {closed_count}/{len(layers)} ไม้")
+                            else:
+                                res = self.bridge.close_position(ticket=t_id, symbol=self.symbol)
+                                if res and res.get("status") == "SUCCESS":
+                                    closed_count += 1
+                    logging.info(f"✅ ปิดรวบกำไร Magic 1212 สำเร็จ: {closed_count}/{len(layers)} ไม้ (Net PnL: +{basket_pnl_pts} pts)")
             else:
                 logging.info("ℹ️ ไม่มีออเดอร์ Magic 1212 ค้างอยู่ จึงไม่ต้องปิด")
 
