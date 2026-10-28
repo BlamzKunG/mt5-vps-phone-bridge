@@ -64,7 +64,7 @@ class FXMultiCurrencyScalperEngine:
         symbol_suffix: Optional[str] = None,
         model: str = "gpt-6-sol",
         secondary_model: str = "gpt-6.1-sol",
-        reasoning_effort: str = "low",
+        reasoning_effort: Optional[str] = None,
         lot_size: float = 0.01,
         max_concurrent_orders: int = 3,
         max_spread_points: float = 25.0,
@@ -87,7 +87,7 @@ class FXMultiCurrencyScalperEngine:
 
         self.model = model
         self.secondary_model = secondary_model
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = reasoning_effort or os.getenv("REASONING_EFFORT", "xhigh")
         self.lot_size = lot_size
         self.max_concurrent_orders = max_concurrent_orders
         self.max_spread_points = max_spread_points
@@ -307,12 +307,12 @@ Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 Analyze the multi-currency matrix, verify correlation sanity, and select at most 3 highest-confluence trades (or HOLD all). Return pure JSON:"""
 
-        logging.info(f"[LLM] Calling Primary Model ({self.model}) with 7-pair snapshot...")
+        logging.info(f"[LLM] Calling Primary Model ({self.model}) with 7-pair snapshot (effort={self.reasoning_effort})...")
         decision = self._call_single_model(
             model_name=self.model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            timeout_seconds=75
+            timeout_seconds=120
         )
 
         if not decision and self.secondary_model:
@@ -321,7 +321,7 @@ Analyze the multi-currency matrix, verify correlation sanity, and select at most
                 model_name=self.secondary_model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                timeout_seconds=75
+                timeout_seconds=120
             )
 
         return decision
