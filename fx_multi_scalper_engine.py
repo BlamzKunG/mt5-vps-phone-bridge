@@ -61,6 +61,7 @@ class FXMultiCurrencyScalperEngine:
         bridge_api_key: Optional[str] = None,
         maxplus_api_key: Optional[str] = None,
         pairs: Optional[List[str]] = None,
+        symbol_suffix: Optional[str] = None,
         model: str = "gpt-6-sol",
         secondary_model: str = "gpt-6.1-sol",
         reasoning_effort: str = "low",
@@ -74,7 +75,16 @@ class FXMultiCurrencyScalperEngine:
         bridge_key = bridge_api_key or os.getenv("BRIDGE_API_KEY", "llm-trade-secret-key-2026")
         self.bridge = RemoteMT5Bridge(vps_url=self.vps_url, api_key=bridge_key)
         self.maxplus_api_key = maxplus_api_key or os.getenv("MAXPLUS_API_KEY", "")
-        self.pairs = pairs or self.DEFAULT_PAIRS
+        
+        self.symbol_suffix = symbol_suffix if symbol_suffix is not None else os.getenv("SYMBOL_SUFFIX", "-ECN")
+        if pairs:
+            self.pairs = pairs
+        else:
+            self.pairs = [
+                f"{p}{self.symbol_suffix}" if self.symbol_suffix and not p.endswith(self.symbol_suffix) else p
+                for p in self.DEFAULT_PAIRS
+            ]
+
         self.model = model
         self.secondary_model = secondary_model
         self.reasoning_effort = reasoning_effort
@@ -336,19 +346,29 @@ Analyze the multi-currency matrix, verify correlation sanity, and select at most
 
         executed_count = 0
         for order in allowed_orders:
-            sym = str(order.get("symbol", "")).upper()
+            sym_input = str(order.get("symbol", "")).upper()
             o_action = str(order.get("action", "")).upper()
             sl_pts = int(order.get("sl_points", 120))
             tp_pts = int(order.get("tp_points", 200))
             conf = float(order.get("confidence", 0.0))
 
             if o_action not in ["BUY", "SELL"]:
-                logging.warning(f"[ORDER SKIP] Invalid action '{o_action}' for {sym}")
+                logging.warning(f"[ORDER SKIP] Invalid action '{o_action}' for {sym_input}")
                 continue
+
+            # จับคู่ Symbol จริง (เช่น EURUSD -> EURUSD-ECN)
+            sym = sym_input
+            if sym not in snapshot:
+                for k in snapshot:
+                    clean_k = k.replace("-", "").replace(".", "").upper()
+                    clean_in = sym_input.replace("-", "").replace(".", "").upper()
+                    if clean_k.startswith(clean_in) or clean_in.startswith(clean_k):
+                        sym = k
+                        break
 
             pair_snap = snapshot.get(sym)
             if not pair_snap:
-                logging.warning(f"[ORDER SKIP] No snapshot data available for {sym}")
+                logging.warning(f"[ORDER SKIP] No snapshot data available for {sym_input} (mapped: {sym})")
                 continue
 
             spread = pair_snap.get("spread_pts", 0.0)

@@ -41,6 +41,7 @@ echo.
 
 set VPS_URL=http://127.0.0.1:8000
 set BRIDGE_API_KEY=llm-trade-secret-key-2026
+set SYMBOL_SUFFIX=-ECN
 
 python fx_multi_scalper_engine.py
 pause

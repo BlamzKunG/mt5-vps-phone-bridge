@@ -188,10 +188,13 @@ class MT5Gateway:
         if not self.ensure_connected():
             return sym_clean
 
-        # 1. เช็คชื่อตรงก่อน (ถ้าส่ง XAUUSD247 หรือ XAUUSD.crp หรือ XAUUSD-ECN มาตรงๆ)
+        # 1. เช็คชื่อตรงก่อน (ถ้าส่ง XAUUSD247 หรือ XAUUSD.crp หรือ XAUUSD-ECN มาตรงๆ และต้องเทรดได้)
         if mt5.symbol_select(sym_clean, True):
-            self.symbol_cache[sym_clean] = sym_clean
-            return sym_clean
+            s_info = mt5.symbol_info(sym_clean)
+            # ตรวจสอบว่า trade_mode ไม่ใช่ 0 (DISABLED)
+            if s_info and getattr(s_info, "trade_mode", 0) != 0:
+                self.symbol_cache[sym_clean] = sym_clean
+                return sym_clean
 
         # 2. จัดเตรียมคีย์ค้นหาหลัก (Aliases)
         if "XAU" in sym_upper or "GOLD" in sym_upper:
